@@ -24,9 +24,9 @@
 #define MAXPACKET	4096		/* max packet size */
 #define IDSEQUENCE	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 #define LEARNROUNDS	5		/* number of INTERVALS to wait before marking any result as lagged */
-#define JITMULT		2
-#define LAGMULT		2
-#define LAGMIN		8
+#define JITMULT		3		/* Sensitive: 2 */
+#define LAGMULT		10		/* Sensitive: 10 */
+#define LAGMIN		8		/* Currently unused */
 
 #define HTMLHEAD1	"<HTML>\n<HEAD>\n<TITLE>Ping stats</TITLE>\n<STYLE type=\"text/css\">\n"
 #define HTMLHEAD2	"BODY { background-color: black; color: rgb(200,200,200) }\n"
@@ -47,6 +47,7 @@ typedef struct target {
   int detached;
   int lastcolor;
   int treecolor;
+  int beepmode;		// 0 = normal, 1 = reverse, 2 = off
   unsigned long rttsum;
   unsigned long oksum;
   unsigned long varsum;
@@ -165,6 +166,7 @@ int main(int argc, char *argv[]) {
     fflush(stdout);
     sleep(1);
   }
+  printf("\b0\n");
 
   if (htmlout) {
     fputs("<HR>\n<TABLE id=\"results\">\n<THEAD>\n<TR><TH>Time\n", htmlout);
@@ -220,6 +222,13 @@ int main(int argc, char *argv[]) {
         showinfo = r;
         print_info();
       }
+      else if ((r == '!') && showinfo) {
+        for (tp = targets; tp; tp = tp->next) {
+          if (tp->id == showinfo) break;
+        }
+        if (tp->beepmode++ == 2) tp->beepmode = 0;
+        print_info();
+      }
       update_screen('f');
     }
   }
@@ -263,6 +272,7 @@ struct timeval check_timers(void) {
       print_scroll("%c  %-30.30s %-15s >%4d ms  (timeout)", currtarget->id, currtarget->hostname, currtarget->address,
         msinterval);
       currtarget->losscount++;
+      if (!currtarget->beepmode) beep();
       if (!currtarget->downsince) currtarget->downsince = now;
       if ((currtarget->lastcolor == 6) && (currtarget->treecolor != 6)) {
         currtarget->treecolor = 6;
@@ -429,7 +439,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       if (htmlout) fprintf(htmlout, "<TD>%d\n", r);
     }
 //    else if ((r <= LAGMULT*tp->rttmin) || (r <= LAGMIN)) {
-    else if (r <= tp->okavg+10*(ampl?ampl:1)) {
+    else if (r <= tp->okavg+LAGMULT*(ampl?ampl:1)) {
       waddch(grid, GRIDMARK|COLOR_PAIR(4));
       wattron(scroller, COLOR_PAIR(4));
       if ((tp->lastcolor >= 4) && (tp->treecolor != 4)) {
@@ -451,8 +461,13 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       if (htmlout) fprintf(htmlout, "<TD class=\"d\">%d\n", r);
     }
     update_screen('g');
+    if (tp->beepmode == 1) beep();
   }
-  else if (icp->icmp_seq != tp->waitping) return;
+  else if (icp->icmp_seq != tp->waitping) {
+    wattron(scroller, COLOR_PAIR(6));
+    print_scroll("%c  %-30.30s %-15s %5d ms  (out of sync)", currtarget->id, currtarget->hostname, currtarget->address, r);
+    return;
+  }
   else {
     tp->rttlast = r;
     ampl = tp->okavg - tp->rttmin;
@@ -504,7 +519,6 @@ int read_targets(void) {
   }
 
   memset(&hints, 0, sizeof(hints));
-  hints.ai_flags = AI_CANONNAME;
   hints.ai_family = PF_INET;
 
   if (htmlout) fputs("<TABLE><TR><TD>ID<TD>Hostname<TD>IP address<TD>Comment\n", htmlout);
@@ -518,7 +532,7 @@ int read_targets(void) {
     }
     strtok(&buf[rank], " \n");
     if ((r = getaddrinfo(&buf[rank], NULL, &hints, &res))) {
-      fprintf(stderr, "- %s: %s\n", &buf[rank], gai_strerror(r));
+      fprintf(stderr, "- %s getaddrinfo(): %s\n", &buf[rank], gai_strerror(r));
       continue;
     }
     if (!(t = (target *)malloc(sizeof(target)))) {
@@ -530,13 +544,16 @@ int read_targets(void) {
       perror("malloc()");
       return -1;
     }
+    if ((r = getnameinfo(res->ai_addr, sizeof(struct sockaddr), t->hostname, HOSTLEN, NULL,0,0))) {
+      fprintf(stderr, "- %s getnameinfo(): %s\n", &buf[rank], gai_strerror(r));
+      continue;
+    }
     t->id = IDSEQUENCE[ntargets];
     if (!t->id) t->id = '?';
     t->rank = rank;
     t->detached = detached;
     if (detached) ndetach++;
     memset(t->addr, 0, sizeof(struct sockaddr_in));
-    strncpy(t->hostname, res->ai_canonname, HOSTLEN);
     memcpy(t->addr, res->ai_addr, sizeof(struct sockaddr_in));
     strncpy(t->address, inet_ntoa(t->addr->sin_addr), 15);
     t->rttmin = -1;
@@ -655,7 +672,7 @@ void start_curses(void) {
   footer = newwin(1, cols, rows-SCROLLSIZE-2, 0);
   scroller = newwin(SCROLLSIZE, cols, rows-SCROLLSIZE-1, 0);
   status = newwin(1, cols, rows-1, 0);
-  hostinfo = newwin(10, 50, (rows-10)/2, (cols-50)/2);
+  hostinfo = newwin(11, 50, (rows-11)/2, (cols-50)/2);
   tree = newwin(ntargets+ndetach+2, maxwidth+5, 1, cols-(maxwidth+5));
   downlist = newwin(2, 40, 1, cols-40-(maxwidth+5));
 
@@ -876,6 +893,8 @@ void print_info(void) {
   mvwaddstr(hostinfo, 7, 2, buf);
   snprintf(buf, 47, "Current status: %s", tp->treecolor==6?"down":"up");
   mvwaddstr(hostinfo, 8, 2, buf);
+  snprintf(buf, 47, "Warning bell: %s", tp->beepmode?tp->beepmode==1?"inverse":"off":"on");
+  mvwaddstr(hostinfo, 9, 2, buf);
 }
 
 void print_down(void) {

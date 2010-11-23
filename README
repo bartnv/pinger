@@ -103,3 +103,61 @@ This program is installed setuid root, due to the need for a raw socket to
  the program to send and recieve arbitraty ICMP messages, which would enable
  various types of DoS attacks. As such it would be wise to restrict use of this
  application to trusted groups of users.
+
+EXAMPLE CONFIGURATION
+
+Using the 10.* ranges where you'd normally find public IP ranges to protect
+ the innocent, should someone decide to copy-paste this configuration and leave
+ it at that. Please make sure you have permission to ping the hosts you are
+ including in your configuration.
+
+Example 1: single-homed site with a residential router
+
+192.168.0.4 local host external interface
+ 192.168.0.3 other host 1
+ 192.168.0.2 other host 2
+ 192.168.0.1 home router internal interface
+  10.0.1.58 home router external interface
+   10.0.1.255 isp inward-facing gateway
+    10.0.2.1 isp dhcp server
+    10.0.2.2 isp nameserver 1
+    10.0.2.3 isp nameserver 2
+
+   10.0.3.1 isp noc gateway
+   10.0.3.2 isp mail server
+   10.0.3.3 isp news server
+   10.0.3.4 isp proxy server
+   10.0.3.5 isp outward-facing gateway
+
+    10.1.0.1 control site 1
+    10.2.0.1 control site 2
+    10.3.0.1 control site 3 gateway
+     10.3.1.1 control site 3
+    10.4.0.1 control site 4
+
+ In this example, the horizontal indentation is used to more-or-less indicate
+ the hops required to get the to various hosts, while the vertical whitespace
+ (empty lines) separate logical groups. The first logical group here comprises
+ the network elements required to give you basic connectivity. The second group
+ providing some standard ISP services. The last group is comprised of some
+ selected hosts on other networks, which can give you an idea of your global
+ connectivity.
+ Keep in mind the internal network structure of your uplink may be very
+ different. Use traceroute or request a network map from your provider to be
+ sure about your local network topology. Also note that not all hosts are
+ configured to reply to ping requests from all other hosts.
+ It is recommended to use more abbreviations in the supplied shortnames, as to
+ keep the width of the network tree window limited.
+
+Example 2: multi-homed server in a professional NOC
+
+10.0.1.48 server external interface
+ 10.0.1.255 isp inward-facing router
+  10.0.2.1 isp core router 1
+  10.0.2.2 isp core router 2
+   10.0.3.1 isp peering router
+    10.1.0.1 peer 1 outward-facing router
+    10.2.0.1 peer 2 outward-facing router
+   10.0.3.2 isp transit router
+    10.3.0.1 transit provider 1 router
+    10.4.0.1 transit provider 2 router
