@@ -1,0 +1,105 @@
+INSTALL
+
+As yet, this code has only been tested on linux. It's been written with
+ portability in mind, but may still need some tweaks, especially with the
+ includes, for other unixes.
+
+Just running 'make' and then 'make install' (as root) should get you a working
+ binary. The latter does not actually copy the binary anywhere, but it needs to
+ be run as root since this is a setuid root application. This is needed because
+ only root can open the raw socket needed to send and recieve ICMP pings. Also
+ see SECURITY.
+
+GENERAL
+
+This application monitors a set of internet hosts for latency problems and
+ downtime. It does this by probing them periodically using ICMP echo messages
+ (aka ping), expecting an echo_reply message in return within a reasonable
+ timeframe. I've chosen for a visual commandline interface, to facilitate a
+ single-glance overview of the status of the monitored hosts, while still
+ allowing the application to be used over an ssh link easily. When doing
+ the latter, it would be suggested to run the program under screen. While
+ the application doesn't terminate on a SIGHUP, it's visual output cannot
+ be recovered otherwise.
+
+In the lower pane of the screen, each individual probe result is shown,
+ colour-coded to indicate the meaning of that result for that particular host.
+ Green indicates a ping reply within a reasonable margin of the host's fastest
+ response-time. Yellow indicates minor jitter in the host's latency, as can be
+ expected due to noral usage of the uplink or internal buffers. Blue indicates
+ more serious delays, going over twice the minimum latency found for the host.
+ Lastly, red indicates that the host did not reply to the echo request within
+ the timeout period. This timeout is a function of the ping interval (by
+ default 60 seconds) divided by the number of hosts being monitored, see
+ CONFIGURATION for more information.
+
+In the upper pane, each symbol (by default '+') indicates one probe. They are
+ coloured in the same way the lines in the lower pane of the screen. Each host
+ has its own column, as indicated by the associated characters in the header
+ line. Series of non-green symbols vertically may indicate issues with the host
+ corresponding to that column, while consistent non-green horizontal lines may
+ indicate issues more local to the machine running the program.
+
+The 'Network tree' window (toggled on by default) gives a quick overview of the
+ status of the monitored hosts. The colours of the associated characters will
+ updated after two consecutive non-green results. The network structure can be
+ shown here and shortnames can be added by specially preparing the targets
+ configuration file, see CONFIGURATION.
+
+The 'Hosts down' window (will appear when there are hosts in the list) shows
+ the hosts that have failed to reply to two or more consecutive probes, until
+ they reply once again.
+
+While running the program, pressing the character associated with one of the
+ monitored hosts will show a window with detailed information about that host.
+ Pressing that character again will toggle it off again. Furthermore, <space>
+ toggles the network tree view and <enter> toggles the list of unreachable
+ hosts. If not toggled on or off explicitly, the latter will be visible only
+ when there are hosts in the list of unreachable hosts.
+
+In recognition of the desire to keep a backlog of probe data longer than
+ the terminal backscroll, an HTML output facility has been added. Simply
+ supply the program with a filename as its first (and only) commandline
+ argument to have it output there. This file will be created or truncated at
+ startup, after root privileges have been dropped.
+
+CONFIGURATION
+
+The hosts to be monitored are specified in a textfile (by default ./targets in
+ the CWD). One hostname or IP address can be specified per line, followed by an
+ optional shortname for the host. Indentation by using spaces and paragraphs
+ using empty lines can be used to indicate the connection structure between the
+ hosts, aswell as identify groups of hosts. Each host will be visually linked
+ to the most previous, lesser indented host in the configuration file. The
+ shortnames (if configured) will be printed in this visual representation of
+ the network tree. A special case is made for the following characters, to draw
+ a box around the name of a group of hosts, like this:
+
+  '-----------`
+  | Groupname |
+  \-----------/
+
+ Clearly, doing this requires a contiguous group of at least 3 host
+ specifications.
+
+At the top of the main.c source-file are some defines that you'd also might
+ want to tweak, but take care while doing so. Please note that the actual
+ timeout to determine whether a host is unreachable or not is a function of
+ the INTERVAL set there divided by the number of hosts you're monitoring.
+ Assuming normal landline connections, if you haven't had a reply in two
+ seconds, you'll probably never get one, so monitoring 30 hosts with the
+ standard 60 second interval should be fine. I recommend upping that if you'll
+ be monitoring more.
+
+SECURITY
+
+This program is installed setuid root, due to the need for a raw socket to
+ send/recieve ICMP messages. If you look at the source-code, you can see that
+ the socket is opened and root privileges are dropped (assuming the program is
+ started as a non-privileged user) straight away, before handling any user- or
+ file input. This is reasonably secure, as long as you can ensure the integrity
+ of the source-code before compilation, and is very very unlikely to assist in
+ any type of root compromise. More feasible would be to abuse bugs elsewhere in
+ the program to send and recieve arbitraty ICMP messages, which would enable
+ various types of DoS attacks. As such it would be wise to restrict use of this
+ application to trusted groups of users.
