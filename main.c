@@ -7,25 +7,36 @@
 #include <sys/select.h>
 #include <ncurses.h>
 #include <time.h>
-
-#include <sys/param.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/file.h>
-#include <netinet/in_systm.h>
-#include <netinet/in.h>
-#include <netinet/ip.h>
+#include <signal.h>
 #include <netinet/ip_icmp.h>
 #include <arpa/inet.h>
+
+//#include <sys/param.h>
+//#include <sys/types.h>
+//#include <sys/socket.h>
+//#include <sys/file.h>
+//#include <netinet/in_systm.h>
+//#include <netinet/in.h>
+//#include <netinet/ip.h>
 
 #define GRIDMARK	'+'
 #define TARGETSFILE	"targets"
 #define INTERVAL	60
-#define SCROLLSIZE	10
+#define SCROLLSIZE	6
 #define LINEBUF		512
 #define HOSTLEN		64
 #define MAXPACKET	4096		/* max packet size */
 #define IDSEQUENCE	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+
+#define HTMLHEAD1	"<HTML>\n<HEAD>\n<TITLE>Ping stats</TITLE>\n<STYLE type=\"text/css\">\n"
+#define HTMLHEAD2	"BODY { background-color: black; color: rgb(200,200,200) }\n"
+#define HTMLHEAD3	"TABLE { text-align: center }\n"
+#define HTMLHEAD8	"TABLE#results TH { color: black; background-color: rgb(200,200,200); width: 1em }\n"
+#define HTMLHEAD4	"TABLE#results TD { color: black; background-color: green; width: 1em }\n"
+#define HTMLHEAD5	"TABLE#results TD.j { background-color: yellow }\n"
+#define HTMLHEAD6	"TABLE#results TD.d { background-color: blue }\n"
+#define HTMLHEAD7	"TABLE#results TD.l { background-color: red }\n"
+#define HTMLHEAD9	"</STYLE></HEAD>\n\n<BODY>\n"
 
 typedef struct target {
   char id;
@@ -35,15 +46,15 @@ typedef struct target {
   int rank;
   int detached;
   int lastcolor;
+  int treecolor;
   unsigned long rttsum;
   unsigned int rttavg;
   unsigned int rttmin;
   unsigned int rttmax;
   unsigned int rttlast;
-  unsigned int downcount;
+  unsigned int losscount;
   unsigned int delaycount;
   time_t downsince;
-  time_t downdur;
   char *comment;
   struct target *next;
   int waitping;
@@ -53,11 +64,11 @@ target *targets;
 
 int pid;
 int sock;
-int ntargets = 0;
+int ntargets = 0, ndown = 0;
 int pinground = 0;
 int rows, cols;
-int msinterval;
-int showdown = 0, showtree = 0;
+int msinterval, maxrank;
+int showdown = 1, showtree = 1;
 char showinfo = '\0';
 
 target *currtarget = NULL;
@@ -65,6 +76,8 @@ target *currtarget = NULL;
 struct timeval nexttv;
 
 WINDOW *header, *footer, *status, *grid, *scroller, *hostinfo, *tree, *downlist;
+
+FILE *htmlout = NULL;
 
 int open_socket(void);
 struct timeval check_timers(void);
@@ -82,8 +95,17 @@ void draw_border(WINDOW *, char *);
 void print_scroll(char *, ...);
 void print_status(char *, ...);
 void print_tree(void);
+void print_info(void);
+void print_down(void);
+void update_screen(int);
+char *itoa(int);
+char *itodur(int);
+void do_exit(int sig);
 
 int main(int argc, char *argv[]) {
+  int c;
+  target *tp;
+
   memset(&nexttv, 0, sizeof(struct timeval));
 
   pid = getpid();
@@ -92,29 +114,92 @@ int main(int argc, char *argv[]) {
 
   setuid(getuid()); // Drop root privileges, we don't need them anymore.
 
-  if (read_targets() == -1) exit(-2);
+  signal(SIGHUP, do_exit);
+  signal(SIGINT, do_exit);
+  signal(SIGTERM, do_exit);
+
+  if (argc == 2) {
+    printf("HTML output file: %s\n", argv[1]);
+    if (!(htmlout = fopen(argv[1], "w"))) {
+      perror("fopen()");
+      exit(-2);
+    }
+    fputs(HTMLHEAD1, htmlout);
+    fputs(HTMLHEAD2, htmlout);
+    fputs(HTMLHEAD3, htmlout);
+    fputs(HTMLHEAD4, htmlout);
+    fputs(HTMLHEAD5, htmlout);
+    fputs(HTMLHEAD6, htmlout);
+    fputs(HTMLHEAD7, htmlout);
+    fputs(HTMLHEAD8, htmlout);
+    fputs(HTMLHEAD9, htmlout);
+  }
+
+  if (read_targets() == -1) exit(-3);
 
   msinterval = INTERVAL*1000/ntargets;
 
-  if (argc == 2) printf("%s\n", argv[1]);
+  sleep(2);
 
-  sleep(5);
+  if (htmlout) {
+    fputs("<HR>\n<TABLE id=\"results\">\n<THEAD>\n<TR><TH>Time\n", htmlout);
+    for (tp = targets; tp; tp = tp->next) fprintf(htmlout, "<TH title=\"%s\">%c\n", tp->hostname, tp->id);
+    fputs("<TBODY>\n", htmlout);
+  }
 
   start_curses();
 
   while (1) {
-    int r, fdmask = 1 << sock;
+    int r;
+    char *cp, *idp = IDSEQUENCE;
+    fd_set fdmask;
     struct timeval timeout;
+
+    FD_ZERO(&fdmask);
+    FD_SET(0, &fdmask);
+    FD_SET(sock, &fdmask);
 
     timeout = check_timers();
 
-    r = select(sock+1, (fd_set *)&fdmask, 0, 0, &timeout);
+    r = select(sock+1, &fdmask, 0, 0, &timeout);
     if (r == -1) {
       if (errno == EINTR) continue;
       perror("select()");
       exit(-3);
     }
-    if (r) read_socket(sock);
+    if (FD_ISSET(0, &fdmask)) {
+      if ((r = getc(stdin)) == EOF) {
+        perror("getc(stdin)");
+        exit(-4);
+      }
+      r = toupper(r);
+      if (r == '\r') {
+        if (showdown && ndown) showdown = 0;
+        else if (showdown == 2) showdown = 1;
+        else if (ndown) {
+          showdown = 1;
+          print_down();
+        }
+        else showdown = 2;
+      }
+      else if (r == ' ') {
+        if (showtree) {
+          showtree = 0;
+          mvwin(downlist, 1, cols-40);
+        }
+        else {
+          showtree = 1;
+          mvwin(downlist, 1, cols-40-(2*maxrank+5));
+        }
+      }
+      else if (r == showinfo) showinfo = '\0';
+      else if (((cp = strchr(idp, r))) && (cp-idp < ntargets)) {
+        showinfo = r;
+        print_info();
+      }
+      update_screen('f');
+    }
+    if (FD_ISSET(sock, &fdmask)) read_socket(sock);
   }
 }
 
@@ -152,10 +237,20 @@ struct timeval check_timers(void) {
     if (currtarget->waitping) {
       waddch(grid, '\b');
       waddch(grid, GRIDMARK|COLOR_PAIR(6));
-      if (currtarget->lastcolor != 6) {
-        currtarget->lastcolor = 6;
+      wattron(scroller, COLOR_PAIR(6));
+      print_scroll("%c  %-30.30s %-15s >%4d ms  (timeout)", currtarget->id, currtarget->hostname, currtarget->address,
+        msinterval);
+      currtarget->losscount++;
+      if (!currtarget->downsince) currtarget->downsince = time(NULL);
+      if ((currtarget->lastcolor == 6) && (currtarget->treecolor != 6)) {
+        currtarget->treecolor = 6;
         print_tree();
+        ndown++;
+        if (showdown) print_down();
       }
+      if (currtarget->id == showinfo) print_info();
+      currtarget->lastcolor = 6;
+      if (htmlout) fputs("<TD class=\"l\">lost\n", htmlout);
     }
     currtarget = currtarget->next;
   }
@@ -164,6 +259,16 @@ struct timeval check_timers(void) {
     pinground++;
     snprintf(timebuf, 9, "\n[%02d:%02d] ", currtm->tm_hour, currtm->tm_min);
     waddstr(grid, timebuf);
+    if (showdown && ndown) print_down();
+    if (htmlout) {
+      if (!pinground%30) {
+        fputs("<TR>\n", htmlout);
+        fprintf(htmlout, "<TH>%02d:%02d\n");
+        for (tp = targets; tp; tp = tp->next) fprintf(htmlout, "<TH title=\"%s\">%c\n", tp->hostname, tp->id);
+      }
+      fflush(htmlout);
+      fprintf(htmlout, "<TR><TD>%02d:%02d\n", currtm->tm_hour, currtm->tm_min);
+    }
     if (pinground > 1) {
       for (tp = targets; tp; tp = tp->next) ellsum += tp->rttlast - tp->rttmin;
       ell = ellsum / ntargets;
@@ -171,25 +276,15 @@ struct timeval check_timers(void) {
   }
 
   if (currtarget->waitping) {
-    wattron(scroller, COLOR_PAIR(6));
-    print_scroll("%c  %-30.30s %-15s Probe %d abandoned (%d second timeout)", currtarget->id, currtarget->hostname,
-      currtarget->address, currtarget->waitping, INTERVAL);
-    currtarget->downcount++;
-    if (!currtarget->downsince) currtarget->downsince = time(NULL);
   }
   send_ping(currtarget);
   waddch(grid, ' ');
   waddch(grid, GRIDMARK);
   currtarget->waitping = pinground;
 
-  if (showtree) {
-    wnoutrefresh(grid);
-    touchwin(tree);
-    wrefresh(tree);
-  }
-  else wrefresh(grid);
-
   print_status("Ping round %d / Monitoring %d hosts / Estimated local latency: %d ms", pinground, ntargets, ell);
+
+  update_screen('a');
 
   memcpy(&nexttv, &currtv, sizeof(struct timeval));
   currtv.tv_sec = msinterval/1000;
@@ -285,7 +380,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
 					// Returning to prevent a potential division by zero 3 lines down
   tp->rttlast = r;
   tp->rttsum += r;
-  tp->rttavg = tp->rttsum / (icp->icmp_seq - tp->downcount);
+  tp->rttavg = tp->rttsum / (icp->icmp_seq - tp->losscount);
   if (r < tp->rttmin) tp->rttmin = r;
   if (r > tp->rttmax) tp->rttmax = r;
   if (icp->icmp_seq == tp->waitping) tp->waitping = 0;
@@ -293,45 +388,49 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
 
   if (tp == currtarget) {
     waddch(grid, '\b');
+    if (tp->treecolor == 6) {
+      tp->downsince = time(NULL);
+      ndown--;
+    }
     if ((pinground <= 3) || (r <= tp->rttavg+2*(ampl?ampl:1))) {
       waddch(grid, GRIDMARK|COLOR_PAIR(3));
       wattron(scroller, COLOR_PAIR(3));
-      if (tp->downsince) {				// Note that delayed responses don't redeem a host of its
-        tp->downdur = time(NULL) - tp->downsince;	// down status. However, because the amplitude is based on
-        tp->downsince = 0;				// the average delay, a long series of higher-latency
-      }							// responses will eventually make the window catch up.
-      if (tp->lastcolor != 3) {
-        tp->lastcolor = 3;
+      if ((tp->lastcolor >= 3) && (tp->treecolor != 3)) {
+        tp->treecolor = 3;
         print_tree();
       }
+      tp->lastcolor = 3;
+      if (htmlout) fprintf(htmlout, "<TD>%d\n", r);
     }
     else if ((r <= 2*tp->rttmin) || (r <= 8)) {
       waddch(grid, GRIDMARK|COLOR_PAIR(4));
       wattron(scroller, COLOR_PAIR(4));
-      if (tp->lastcolor != 4) {
-        tp->lastcolor = 4;
+      if ((tp->lastcolor >= 4) && (tp->treecolor != 4)) {
+        tp->treecolor = 4;
         print_tree();
       }
+      tp->lastcolor = 4;
+      if (htmlout) fprintf(htmlout, "<TD class=\"j\">%d\n", r);
     }
     else {
       waddch(grid, GRIDMARK|COLOR_PAIR(5));
       wattron(scroller, COLOR_PAIR(5));
       tp->delaycount++;
-      if (tp->lastcolor != 5) {
-        tp->lastcolor = 5;
+      if ((tp->lastcolor >= 5) && (tp->treecolor != 5)) {
+        tp->treecolor = 5;
         print_tree();
       }
+      tp->lastcolor = 5;
+      if (htmlout) fprintf(htmlout, "<TD class=\"d\">%d\n", r);
     }
-    if (showtree) {
-      wnoutrefresh(grid);
-      touchwin(tree);
-      wrefresh(tree);
-    }
-    else wrefresh(grid);
+    update_screen('g');
   }
   else wattron(scroller, COLOR_PAIR(6));
 
+  if (tp->id == showinfo) print_info();
+
   print_scroll("%c  %-30.30s %-15s  %4d ms  (avg %3d ± %2d)", tp->id, tp->hostname, tp->address, r, tp->rttavg, ampl);
+  update_screen('s');
 }
 
 char *print_type(int t) {
@@ -361,7 +460,7 @@ char *print_type(int t) {
 }
 
 int read_targets(void) {
-  int rank, detached;
+  int r, rank, detached;
   char buf[LINEBUF+1], *tmp2;
   target *t, *tmp;
   struct addrinfo hints, *res = NULL;
@@ -376,6 +475,8 @@ int read_targets(void) {
   hints.ai_flags = AI_CANONNAME;
   hints.ai_family = PF_INET;
 
+  if (htmlout) fputs("<TABLE><TR><TD>ID<TD>Hostname<TD>IP address<TD>Comment\n", htmlout);
+
   while (fgets(buf, LINEBUF, fp)) {
     for (rank = 0; buf[rank] == ' '; rank++);
     if (!buf[rank]) return;
@@ -384,8 +485,8 @@ int read_targets(void) {
       continue;
     }
     strtok(&buf[rank], " \n");
-    if (getaddrinfo(&buf[rank], NULL, &hints, &res)) {
-      fprintf(stderr, "getaddrinfo(): %s\n", gai_strerror(errno));
+    if ((r = getaddrinfo(&buf[rank], NULL, &hints, &res))) {
+      fprintf(stderr, "- %s: %s\n", &buf[rank], gai_strerror(r));
       continue;
     }
     if (!(t = (target *)malloc(sizeof(target)))) {
@@ -400,12 +501,14 @@ int read_targets(void) {
     t->id = IDSEQUENCE[ntargets];
     if (!t->id) t->id = '?';
     t->rank = rank;
+    if (rank > maxrank) maxrank = rank;
     t->detached = detached;
     memset(t->addr, 0, sizeof(struct sockaddr_in));
     strncpy(t->hostname, res->ai_canonname, HOSTLEN);
     memcpy(t->addr, res->ai_addr, sizeof(struct sockaddr_in));
     strncpy(t->address, inet_ntoa(t->addr->sin_addr), 15);
     t->rttmin = -1;
+    t->lastcolor = 99;
     tmp2 = strtok(NULL, "\n");
     if (tmp2) {
       if (!(t->comment = (char *)malloc(strlen(tmp2)+1))) {
@@ -423,13 +526,20 @@ int read_targets(void) {
     }
     ntargets++;
     detached = 0;
+
+    if (t->comment) {
+      printf("%c %s (%s) %s\n", t->id, t->hostname, t->address, t->comment);
+      if (htmlout) fprintf(htmlout, "<TR><TD>%c<TD>%s<TD>%s<TD>%s\n", t->id, t->hostname, t->address, t->comment);
+    }
+    else {
+      printf("%c %s (%s)\n", t->id, t->hostname, t->address);
+      if (htmlout) fprintf(htmlout, "<TR><TD>%c<TD>%s<TD>%s\n", t->id, t->hostname, t->address);
+    }
   }
 
-  for (tmp = targets; tmp; tmp = tmp->next) {
-    if (tmp->comment) printf("%c %s (%s) rank %d%s \"%s\"\n", tmp->id, tmp->hostname, tmp->address, tmp->rank,
-      tmp->detached?", detached":"", tmp->comment);
-    else printf("%c %s (%s) rank %d%s\n", tmp->id, tmp->hostname, tmp->address, tmp->rank, tmp->detached?", detached":"");
-  }
+  if (htmlout) fputs("</TABLE>\n", htmlout);
+
+  if (!ntargets) return -1;
 
   return 0;
 }
@@ -479,7 +589,6 @@ u_short calc_checksum(struct icmp *addr, int len) {
 
 void start_curses(void) {
   int c, x, y;
-  target *t;
 
   initscr();
   cbreak();
@@ -506,18 +615,14 @@ void start_curses(void) {
     exit(-17);
   }
 
-  for (t = targets; t; t = t->next) {
-    if (t->rank > c) c = t->rank;
-  }
-
   header = newwin(1, cols, 0, 0);
   grid = newwin(rows-SCROLLSIZE-3, cols, 1, 0);
   footer = newwin(1, cols, rows-SCROLLSIZE-2, 0);
   scroller = newwin(SCROLLSIZE, cols, rows-SCROLLSIZE-1, 0);
   status = newwin(1, cols, rows-1, 0);
-  hostinfo = newwin(8, 40, (rows-8)/2, (cols-40)/2);
-  tree = newwin(ntargets+2, 2*c+5, 1, cols-(2*c+5));
-  downlist = newwin(10, 40, 1, cols-40);
+  hostinfo = newwin(10, 50, (rows-10)/2, (cols-50)/2);
+  tree = newwin(ntargets+2, 2*maxrank+5, 1, cols-(2*maxrank+5));
+  downlist = newwin(2, 40, 1, cols-40-(2*maxrank+5));
 
   if (!header || !grid || !footer || !scroller || !status || !hostinfo) {
     noraw();
@@ -556,14 +661,12 @@ void start_curses(void) {
     waddch(header, ACS_HLINE);
     waddch(footer, ACS_HLINE);
   }
-  wrefresh(header);
-  wrefresh(footer);
 
   draw_border(downlist, " Hosts down ");
   draw_border(tree, " Map ");
   wattron(tree, COLOR_PAIR(5));
   print_tree();
-  showtree = 1;
+  update_screen('h');
 
   for (c = 0; c < SCROLLSIZE; c++) waddch(scroller, '\n');
   for (c = 0; c < rows-SCROLLSIZE; c++) waddch(grid, '\n');
@@ -575,7 +678,7 @@ void draw_border(WINDOW *win, char *title) {
   int c, x, y;
 
   getmaxyx(win, y, x);			// getmaxyx returns the number of available cols/rows
-  if ((x-- < 3) || (y-- < 3)) return;	// -- them to get the correct index for use in wmove()
+  if ((x-- < 2) || (y-- < 2)) return;	// -- them to get the correct index for use in wmove()
 
   wattron(win, COLOR_PAIR(5));
   wmove(win, 0, 0);
@@ -611,7 +714,6 @@ void print_scroll(char *fmt, ...) {
   waddch(scroller, '\n');
   waddstr(scroller, buf);
   wclrtoeol(scroller);
-  wrefresh(scroller);
 }
 
 void print_status(char *fmt, ...) {
@@ -636,7 +738,6 @@ void print_status(char *fmt, ...) {
   wattron(status, COLOR_PAIR(5));
   getyx(status, y, x);
   for (; x < cols; x++) waddch(status, ACS_HLINE);
-  wrefresh(status);
 }
 
 void print_tree(void) {
@@ -646,7 +747,7 @@ void print_tree(void) {
   wmove(tree, 1, 2);
   for (n = 0, t1 = targets; t1; n++, t1 = t1->next) {
     wmove(tree, n+1, 2*t1->rank+2);
-    switch (t1->lastcolor) {
+    switch (t1->treecolor) {
       case 3: waddch(tree, t1->id|COLOR_PAIR(3));
               break;
       case 4: waddch(tree, t1->id|COLOR_PAIR(4));
@@ -673,4 +774,150 @@ void print_tree(void) {
       else if (more) waddch(tree, ACS_VLINE);
     }
   }
+}
+
+void print_info(void) {
+  char buf[47];
+  target *tp;
+
+  for (tp = targets; tp; tp = tp->next) {
+    if (tp->id == showinfo) break;
+  }
+  if (!tp || !pinground) return;
+
+  werase(hostinfo);
+  draw_border(hostinfo, " Host info ");
+
+  snprintf(buf, 47, "%c %s (%s) %s", tp->id, tp->hostname, tp->address, tp->comment?tp->comment:"");
+  mvwaddstr(hostinfo, 1, 2, buf);
+  snprintf(buf, 47, "Min: %5d", tp->rttmin);
+  mvwaddstr(hostinfo, 2, 2, buf);
+  snprintf(buf, 47, "Avg: %5d", tp->rttavg);
+  mvwaddstr(hostinfo, 3, 2, buf);
+  snprintf(buf, 47, "Max: %5d", tp->rttmax);
+  mvwaddstr(hostinfo, 4, 2, buf);
+  snprintf(buf, 47, "Last: %4d", tp->rttlast);
+  mvwaddstr(hostinfo, 5, 2, buf);
+  snprintf(buf, 47, "Packets delayed: %4d (%d%%)", tp->delaycount, tp->delaycount*100/pinground);
+  mvwaddstr(hostinfo, 6, 2, buf);
+  snprintf(buf, 47, "Packets lost: %7d (%d%%)", tp->losscount, tp->losscount*100/pinground);
+  mvwaddstr(hostinfo, 7, 2, buf);
+  snprintf(buf, 47, "Current status: %s", tp->treecolor==6?"down":"up");
+  mvwaddstr(hostinfo, 8, 2, buf);
+}
+
+void print_down(void) {
+  int ccols, crows, line = 1;
+  char buf[48];
+  target *tp;
+
+  getmaxyx(downlist, crows, ccols);
+  if (crows-2 != ndown) {
+    delwin(downlist);
+    if (showtree) downlist = newwin(ndown+2, 40, 1, cols-40-(2*maxrank+5));
+    else downlist = newwin(ndown+2, 40, 1, cols-40);
+    draw_border(downlist, " Hosts down ");
+  }
+  for (tp = targets; tp; tp = tp->next) {
+    if (tp->treecolor == 6) {
+      snprintf(buf, 48, "%c %-25.25s %s", tp->id, tp->hostname, itodur((int)time(NULL)-tp->downsince));
+      mvwaddstr(downlist, line++, 2, buf);
+    }
+  }
+}
+
+void update_screen(int win) {
+  switch (win) {
+    case 'h': touchwin(header);
+              wnoutrefresh(header);
+    case 'f': touchwin(footer);
+              wnoutrefresh(footer);
+    case 'a': touchwin(status);
+              wnoutrefresh(status);
+    case 'g': touchwin(grid);
+              wnoutrefresh(grid);
+    case 's': touchwin(scroller);
+              wnoutrefresh(scroller);
+    case 't': if (showtree) {
+                touchwin(tree);
+                wnoutrefresh(tree);
+              }
+    case 'd': if ((showdown == 2) || (showdown && ndown)) {
+                touchwin(downlist);
+                wnoutrefresh(downlist);
+              }
+    case 'i': if (showinfo) {
+                touchwin(hostinfo);
+                wnoutrefresh(hostinfo);
+              }
+    default:  doupdate();
+  }
+}
+
+char *itoa(int digits) {
+   static char buf[11];
+   char *ptr = buf;
+   int r, c = 1;
+
+   while (digits/c > 9) c *= 10;
+   do {
+      r = digits/c;
+      *ptr++ = r+48;
+      digits -= r*c;
+      c /= 10;
+   } while (c);
+   *ptr = 0;
+   return buf;
+}
+
+char *itodur(int digits) {
+   static char buf[9];
+   static int delta[] = { 31449600, 604800, 86400, 3600, 60 };
+   static char unit[] = "ywdhm";
+   int c, r;
+   char *ptr;
+
+   memset(buf, 0, 9);
+
+   if (digits < 60) {
+      strcpy(buf, "0m");
+      return buf;
+   }
+
+   for (c = 0; digits < delta[c]; c++);
+   strcpy(buf, itoa(digits/delta[c]));
+   ptr = strchr(buf, '\0');
+   *ptr = unit[c];
+   if ((r = digits%delta[c] >= 60)) {
+      *++ptr = ' ';
+      strcat(buf, itoa(r/delta[++c]));
+      ptr = strchr(buf, '\0');
+      *ptr = unit[c];
+   }
+   return buf;
+}
+
+void do_exit(int sig) {
+  target *tp;
+
+  close(sock);
+
+  if (htmlout) {
+    fputs("</TABLE>\n<HR>\n", htmlout);
+    for (tp = targets; tp; tp = tp->next) {
+      fputs("<P>\n", htmlout);
+      fprintf(htmlout, "%c %s (%s) %s<BR>\n", tp->id, tp->hostname, tp->address, tp->comment?tp->comment:"");
+      fprintf(htmlout, "Min: %d / Avg: %d / Max: %d / Last: %d<BR>\n", tp->rttmin, tp->rttavg, tp->rttmax, tp->rttlast);
+      fprintf(htmlout, "Packets lost: %d (%d%%) / Packets delayed: %d (%d%%)\n", tp->losscount,
+        tp->losscount*100/pinground, tp->delaycount, tp->delaycount*100/pinground);
+      fputs("</P>", htmlout);
+    }
+    fputs("\n</BODY>\n</HTML>\n", htmlout);
+  }
+
+  noraw();
+  echo();
+  endwin();
+
+  exit(0);
 }
