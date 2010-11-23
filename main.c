@@ -18,6 +18,7 @@
 #define GRIDMARK	'+'
 #define TARGETSFILE	"targets"
 #define INTERVAL	60
+#define BACKLOG		100		/* Number of intervals to keep full data from in memory */
 #define SCROLLSIZE	6
 #define LINEBUF		512
 #define HOSTLEN		64
@@ -27,6 +28,11 @@
 #define JITMULT		3		/* Sensitive: 2 */
 #define LAGMULT		10		/* Sensitive: 10 */
 #define LAGMIN		8		/* Currently unused */
+
+#define STATE_OK	3
+#define STATE_JIT	4
+#define STATE_LAG	5
+#define STATE_LOSS	6
 
 #define HTMLHEAD1	"<HTML>\n<HEAD>\n<TITLE>Ping stats</TITLE>\n<STYLE type=\"text/css\">\n"
 #define HTMLHEAD2	"BODY { background-color: black; color: rgb(200,200,200) }\n"
@@ -38,7 +44,32 @@
 #define HTMLHEAD7	"TABLE#results TD.l { background-color: red }\n"
 #define HTMLHEAD9	"</STYLE></HEAD>\n\n<BODY>\n"
 
+typedef struct pingdata {
+  unsigned int rtt;
+  int color;
+} pingdata;
+
+typedef struct passdata {
+  time_t time;
+  pingdata *data;
+} passdata;
+
+passdata *backlog;
+int currlog = 0;
+
+typedef struct logdata {
+  unsigned int count;
+  unsigned int rttmin;
+  unsigned int rttavg;
+  unsigned int rttmax;
+  unsigned int delaycount;
+  unsigned int losscount;
+  unsigned int okavg;
+  float stddev;
+} logdata;
+
 typedef struct target {
+  int num;
   char id;
   char hostname[HOSTLEN+1];
   char address[16];
@@ -50,7 +81,7 @@ typedef struct target {
   int beepmode;		// 0 = normal, 1 = reverse, 2 = off
   unsigned long rttsum;
   unsigned long oksum;
-  unsigned long varsum;
+  unsigned long sqsum;
   unsigned int rttavg;
   unsigned int okavg;
   unsigned int rttmin;
@@ -103,6 +134,7 @@ void print_tree(void);
 void print_info(void);
 void print_down(void);
 void update_screen(int);
+logdata *get_logdata(int);
 char *itoa(int);
 char *itodur(int);
 void sig_winch(int);
@@ -148,6 +180,23 @@ int main(int argc, char *argv[]) {
   }
 
   if (read_targets() == -1) exit(-3);
+
+  backlog = (passdata *)malloc(sizeof(passdata)*BACKLOG);
+  if (!backlog) {
+    printf("Error allocating memory for backlog; system out of memory?\n");
+    exit(-4);
+  }
+  memset(backlog, 0, sizeof(passdata)*BACKLOG);
+  for (c = 0; c < BACKLOG; c++) {
+    backlog[c].data = (pingdata *)malloc(sizeof(pingdata)*ntargets);
+    if (!backlog[c].data) {
+      printf("Error allocating memory for backlog; system out of memory?\n");
+      exit(-5);
+    }
+    memset(backlog[c].data, 0, sizeof(pingdata)*ntargets);
+  }
+
+  printf("Data storage for backlog initialised (%d bytes)\n", sizeof(passdata)*BACKLOG*sizeof(pingdata)*ntargets);
 
   memset(&nexttv, 0, sizeof(struct timeval));
 
@@ -195,7 +244,7 @@ int main(int argc, char *argv[]) {
     if (FD_ISSET(0, &fdmask)) {
       if ((r = getc(stdin)) == EOF) {
         perror("getc(stdin)");
-        exit(-4);
+        exit(-7);
       }
       r = toupper(r);
       if (r == '\r') {
@@ -267,21 +316,23 @@ struct timeval check_timers(void) {
   if (currtarget) {
     if (currtarget->waitping) {
       waddch(grid, '\b');
-      waddch(grid, GRIDMARK|COLOR_PAIR(6));
-      wattron(scroller, COLOR_PAIR(6));
+      waddch(grid, GRIDMARK|COLOR_PAIR(STATE_LOSS));
+      wattron(scroller, COLOR_PAIR(STATE_LOSS));
       print_scroll("%c  %-30.30s %-15s >%4d ms  (timeout)", currtarget->id, currtarget->hostname, currtarget->address,
         msinterval);
       currtarget->losscount++;
       if (!currtarget->beepmode) beep();
       if (!currtarget->downsince) currtarget->downsince = now;
-      if ((currtarget->lastcolor == 6) && (currtarget->treecolor != 6)) {
-        currtarget->treecolor = 6;
+      if ((currtarget->lastcolor == STATE_LOSS) && (currtarget->treecolor != STATE_LOSS)) {
+        currtarget->treecolor = STATE_LOSS;
         print_tree();
         ndown++;
         if (showdown) print_down();
       }
+      backlog[currlog].data[currtarget->num].rtt = -1;
+      backlog[currlog].data[currtarget->num].color = STATE_LOSS;
+      currtarget->lastcolor = STATE_LOSS;
       if (currtarget->id == showinfo) print_info();
-      currtarget->lastcolor = 6;
       if (htmlout) fputs("<TD class=\"l\">lost\n", htmlout);
     }
     currtarget = currtarget->next;
@@ -304,6 +355,8 @@ struct timeval check_timers(void) {
       for (tp = targets; tp; tp = tp->next) ellsum += tp->rttlast - tp->rttmin;
       ell = ellsum / ntargets;
     }
+    if (++currlog == BACKLOG) currlog = 0;
+    backlog[currlog].time = now;
   }
 
   waddch(grid, ' ');
@@ -412,66 +465,69 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
     tp->waitping = 0;
     tp->rttlast = r;
     tp->rttsum += r;
-    ampl = r - tp->rttavg;
     tp->rttavg = tp->rttsum / (icp->icmp_seq - tp->losscount);
-    tp->varsum += ampl * (r - tp->rttavg);
+    tp->sqsum += powf(r,2);
     if (r < tp->rttmin) tp->rttmin = r;
     if (r > tp->rttmax) tp->rttmax = r;
     if (!tp->okcount) tp->okavg = tp->rttavg;
     ampl = tp->okavg - tp->rttmin;
+    backlog[currlog].data[tp->num].rtt = r;
 
     waddch(grid, '\b');
-    if (tp->treecolor == 6) {
+    if (tp->treecolor == STATE_LOSS) {
       tp->downsince = time(NULL);
       ndown--;
     }
     if ((pinground <= LEARNROUNDS) || (r <= tp->okavg+JITMULT*(ampl?ampl:1))) {
-      waddch(grid, GRIDMARK|COLOR_PAIR(3));
-      wattron(scroller, COLOR_PAIR(3));
-      if ((tp->lastcolor >= 3) && (tp->treecolor != 3)) {
-        tp->treecolor = 3;
+      waddch(grid, GRIDMARK|COLOR_PAIR(STATE_OK));
+      wattron(scroller, COLOR_PAIR(STATE_OK));
+      if ((tp->lastcolor >= STATE_OK) && (tp->treecolor != STATE_OK)) {
+        tp->treecolor = STATE_OK;
         print_tree();
       }
-      tp->lastcolor = 3;
+      tp->lastcolor = STATE_OK;
       tp->okcount++;
       tp->oksum += r;
       tp->okavg = tp->oksum/tp->okcount;
       if (htmlout) fprintf(htmlout, "<TD>%d\n", r);
+      backlog[currlog].data[tp->num].color = STATE_OK;
     }
 //    else if ((r <= LAGMULT*tp->rttmin) || (r <= LAGMIN)) {
     else if (r <= tp->okavg+LAGMULT*(ampl?ampl:1)) {
-      waddch(grid, GRIDMARK|COLOR_PAIR(4));
-      wattron(scroller, COLOR_PAIR(4));
-      if ((tp->lastcolor >= 4) && (tp->treecolor != 4)) {
-        tp->treecolor = 4;
+      waddch(grid, GRIDMARK|COLOR_PAIR(STATE_JIT));
+      wattron(scroller, COLOR_PAIR(STATE_JIT));
+      if ((tp->lastcolor >= STATE_JIT) && (tp->treecolor != STATE_JIT)) {
+        tp->treecolor = STATE_JIT;
         print_tree();
       }
-      tp->lastcolor = 4;
+      tp->lastcolor = STATE_JIT;
       if (htmlout) fprintf(htmlout, "<TD class=\"j\">%d\n", r);
+      backlog[currlog].data[tp->num].color = STATE_JIT;
     }
     else {
-      waddch(grid, GRIDMARK|COLOR_PAIR(5));
-      wattron(scroller, COLOR_PAIR(5));
+      waddch(grid, GRIDMARK|COLOR_PAIR(STATE_LAG));
+      wattron(scroller, COLOR_PAIR(STATE_LAG));
       tp->delaycount++;
-      if ((tp->lastcolor >= 5) && (tp->treecolor != 5)) {
-        tp->treecolor = 5;
+      if ((tp->lastcolor >= STATE_LAG) && (tp->treecolor != STATE_LAG)) {
+        tp->treecolor = STATE_LAG;
         print_tree();
       }
-      tp->lastcolor = 5;
+      tp->lastcolor = STATE_LAG;
       if (htmlout) fprintf(htmlout, "<TD class=\"d\">%d\n", r);
+      backlog[currlog].data[tp->num].color = STATE_LAG;
     }
     update_screen('g');
     if (tp->beepmode == 1) beep();
   }
   else if (icp->icmp_seq != tp->waitping) {
-    wattron(scroller, COLOR_PAIR(6));
+    wattron(scroller, COLOR_PAIR(STATE_LOSS));
     print_scroll("%c  %-30.30s %-15s %5d ms  (out of sync)", currtarget->id, currtarget->hostname, currtarget->address, r);
     return;
   }
   else {
     tp->rttlast = r;
     ampl = tp->okavg - tp->rttmin;
-    wattron(scroller, COLOR_PAIR(6));
+    wattron(scroller, COLOR_PAIR(STATE_LOSS));
   }
 
   if (tp->id == showinfo) print_info();
@@ -548,6 +604,7 @@ int read_targets(void) {
       fprintf(stderr, "- %s getnameinfo(): %s\n", &buf[rank], gai_strerror(r));
       continue;
     }
+    t->num = ntargets;
     t->id = IDSEQUENCE[ntargets];
     if (!t->id) t->id = '?';
     t->rank = rank;
@@ -650,10 +707,10 @@ void start_curses(void) {
   start_color();
   init_pair(1, COLOR_WHITE, COLOR_BLACK);
   init_pair(2, COLOR_WHITE, COLOR_BLUE);
-  init_pair(3, COLOR_GREEN, COLOR_BLACK);
-  init_pair(4, COLOR_YELLOW, COLOR_BLACK);
-  init_pair(5, COLOR_BLUE, COLOR_BLACK);
-  init_pair(6, COLOR_RED, COLOR_BLACK);
+  init_pair(STATE_OK, COLOR_GREEN, COLOR_BLACK);
+  init_pair(STATE_JIT, COLOR_YELLOW, COLOR_BLACK);
+  init_pair(STATE_LAG, COLOR_BLUE, COLOR_BLACK);
+  init_pair(STATE_LOSS, COLOR_RED, COLOR_BLACK);
 
   init_pair(7, COLOR_MAGENTA, COLOR_BLACK);
   init_pair(8, COLOR_CYAN, COLOR_BLACK);
@@ -672,7 +729,7 @@ void start_curses(void) {
   footer = newwin(1, cols, rows-SCROLLSIZE-2, 0);
   scroller = newwin(SCROLLSIZE, cols, rows-SCROLLSIZE-1, 0);
   status = newwin(1, cols, rows-1, 0);
-  hostinfo = newwin(11, 50, (rows-11)/2, (cols-50)/2);
+  hostinfo = newwin(15, 51, (rows-15)/2, (cols-51)/2);
   tree = newwin(ntargets+ndetach+2, maxwidth+5, 1, cols-(maxwidth+5));
   downlist = newwin(2, 40, 1, cols-40-(maxwidth+5));
 
@@ -802,13 +859,13 @@ void print_tree(void) {
   for (n = 0, t1 = targets; t1; n++, t1 = t1->next) {
     wmove(tree, n+1+detach1, 2*t1->rank+2);
     switch (t1->treecolor) {
-      case 3: waddch(tree, t1->id|COLOR_PAIR(3));
+      case 3: waddch(tree, t1->id|COLOR_PAIR(STATE_OK));
               break;
-      case 4: waddch(tree, t1->id|COLOR_PAIR(4));
+      case 4: waddch(tree, t1->id|COLOR_PAIR(STATE_JIT));
               break;
-      case 5: waddch(tree, t1->id|COLOR_PAIR(5));
+      case 5: waddch(tree, t1->id|COLOR_PAIR(STATE_LAG));
               break;
-      case 6: waddch(tree, t1->id|COLOR_PAIR(6));
+      case 6: waddch(tree, t1->id|COLOR_PAIR(STATE_LOSS));
               break;
       default: waddch(tree, t1->id|COLOR_PAIR(1));
     }
@@ -862,39 +919,52 @@ void print_tree(void) {
 }
 
 void print_info(void) {
-  char buf[47];
+  char buf[48];
   float stddev;
   target *tp;
+  logdata *ld;
 
   for (tp = targets; tp; tp = tp->next) {
     if (tp->id == showinfo) break;
   }
   if (!tp || !pinground) return;
 
+  ld = get_logdata(tp->num);
+
+//  print_scroll("get_logdata returned: count = %d / min = %d / avg = %d / max = %d / okavg = %d / delaycount = %d / losscount = %d", ld->count, ld->rttmin, ld->rttavg, ld->rttmax, ld->okavg, ld->delaycount, ld->losscount);
+
   werase(hostinfo);
   draw_border(hostinfo, " Host info ");
 
-  stddev = sqrt(tp->varsum/pinground);
+  stddev = sqrtf(tp->sqsum/pinground-pow(tp->rttavg,2));
 
-  snprintf(buf, 47, "%c %s (%s)", tp->id, tp->hostname, tp->address);
+  if (strlen(tp->hostname)+strlen(tp->address)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->hostname, tp->address);
+  else snprintf(buf, 48, "%c %s", tp->id, tp->hostname);
   mvwaddstr(hostinfo, 1, 2, buf);
-  snprintf(buf, 47, "Min: %5d    |    Baseline: %d", tp->rttmin, tp->okavg);
+  snprintf(buf, 48, "Overall statistics     | Last %d minutes", BACKLOG*INTERVAL/60);
   mvwaddstr(hostinfo, 2, 2, buf);
-  snprintf(buf, 47, "Avg: %5d    |    Std.Dev.: %.2f", tp->rttavg, stddev);
+  snprintf(buf, 48, "Baseline: %5d ± %-4d | %5d ± %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
   mvwaddstr(hostinfo, 3, 2, buf);
-  if (!stddev) snprintf(buf, 47, "Max: %5d", tp->rttmax);
-  else snprintf(buf, 47, "Max: %5d (%d-sigma)", tp->rttmax, (int)((tp->rttmax-tp->rttavg)/sqrt(tp->varsum/pinground)+1));
+  snprintf(buf, 48, "Min:          %5d    | %5d", tp->rttmin, ld->rttmin);
   mvwaddstr(hostinfo, 4, 2, buf);
-  snprintf(buf, 47, "Last: %4d", tp->rttlast);
+  snprintf(buf, 48, "Avg:          %5d    | %5d", tp->rttavg, ld->rttavg);
   mvwaddstr(hostinfo, 5, 2, buf);
-  snprintf(buf, 47, "Packets delayed: %4d (%.1f%%)", tp->delaycount, tp->delaycount*100.0/pinground);
+  //if (!stddev)
+  snprintf(buf, 47, "Max:          %5d    | %5d", tp->rttmax, ld->rttmax);
+  //else snprintf(buf, 48, "Max:          %5d %ds |     x", tp->rttmax, (int)((tp->rttmax-tp->rttavg)/sqrt(tp->varsum/pinground)+1));
   mvwaddstr(hostinfo, 6, 2, buf);
-  snprintf(buf, 47, "Packets lost: %7d (%.1f%%)", tp->losscount, tp->losscount*100.0/pinground);
+  snprintf(buf, 48, "Last:         %5d", tp->rttlast);
   mvwaddstr(hostinfo, 7, 2, buf);
-  snprintf(buf, 47, "Current status: %s", tp->treecolor==6?"down":"up");
+  snprintf(buf, 48, "Std.Dev.:        %5.2f |    %5.2f", stddev, ld->stddev);
   mvwaddstr(hostinfo, 8, 2, buf);
-  snprintf(buf, 47, "Warning bell: %s", tp->beepmode?tp->beepmode==1?"inverse":"off":"on");
+  snprintf(buf, 48, "Probes delayed: %5.1f%% |   %5.1f%%", tp->delaycount*100.0/pinground, ld->count?ld->delaycount*100.0/ld->count:0.0);
   mvwaddstr(hostinfo, 9, 2, buf);
+  snprintf(buf, 48, "Probes lost:    %5.1f%% |   %5.1f%%", tp->losscount*100.0/pinground, ld->count?ld->losscount*100.0/ld->count:0.0);
+  mvwaddstr(hostinfo, 10, 2, buf);
+  snprintf(buf, 48, "Warning bell: %s", tp->beepmode?tp->beepmode==1?"inverse":"off":"on");
+  mvwaddstr(hostinfo, 11, 2, buf);
+  snprintf(buf, 48, "Current status: %s", tp->treecolor==STATE_LOSS?"down":"up");
+  mvwaddstr(hostinfo, 12, 2, buf);
 }
 
 void print_down(void) {
@@ -910,7 +980,7 @@ void print_down(void) {
     draw_border(downlist, " Hosts down ");
   }
   for (tp = targets; tp; tp = tp->next) {
-    if (tp->treecolor == 6) {
+    if (tp->treecolor == STATE_LOSS) {
       snprintf(buf, 48, "%c %-25.25s %s", tp->id, tp->hostname, itodur((int)time(NULL)-tp->downsince));
       mvwaddstr(downlist, line++, 2, buf);
     }
@@ -943,6 +1013,47 @@ void update_screen(int win) {
               }
     default:  doupdate();
   }
+}
+
+logdata *get_logdata(int num) {
+  int i, okcount = 0;
+  unsigned int totsum = 0, oksum = 0;
+  float sqsum = 0;
+  static logdata res;
+
+  memset(&res, 0, sizeof(logdata));
+  res.rttmin = -1;
+
+  for (i = 0; i < BACKLOG; i++) {
+    if (!backlog[i].data[num].color) {					// Might be current ping round
+      if ((++i == BACKLOG) || (!backlog[i].data[num].color)) break;	// or the end of the (used) backlog
+    }
+    res.count++;
+    if (backlog[i].data[num].color == STATE_LOSS) res.losscount++;
+    else {
+      totsum += backlog[i].data[num].rtt;
+      sqsum += powf(backlog[i].data[num].rtt,2);
+      if (backlog[i].data[num].rtt < res.rttmin) res.rttmin = backlog[i].data[num].rtt;
+      if (backlog[i].data[num].rtt > res.rttmax) res.rttmax = backlog[i].data[num].rtt;
+      if (backlog[i].data[num].color == STATE_LAG) res.delaycount++;
+      else if (backlog[i].data[num].color != STATE_JIT) {
+        oksum += backlog[i].data[num].rtt;
+        okcount++;
+      }
+    }
+  };
+  if (res.count) res.rttavg = totsum/res.count;
+  else res.rttavg = 0;
+  if (okcount) res.okavg = oksum/okcount;
+  else res.okavg = 0;
+  if (sqsum) {		// if sqsum != 0 then there must've been a non-loss result and thus res.count > res.losscount
+    res.stddev = sqsum/(res.count-res.losscount);	// preventing a division by zero here
+    res.stddev = res.stddev - powf(res.rttavg,2);
+    res.stddev = sqrtf(res.stddev);
+  }
+  else res.stddev = 0;
+
+  return &res;
 }
 
 char *itoa(int digits) {
@@ -979,7 +1090,7 @@ char *itodur(int digits) {
    strcpy(buf, itoa(digits/delta[c]));
    ptr = strchr(buf, '\0');
    *ptr = unit[c];
-   if ((r = digits%delta[c] >= 60)) {
+   if ((r = digits%delta[c]) >= 60) {
       *++ptr = ' ';
       strcat(buf, itoa(r/delta[++c]));
       ptr = strchr(buf, '\0');
