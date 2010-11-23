@@ -26,7 +26,7 @@ In the lower pane of the screen, each individual probe result is shown,
  colour-coded to indicate the meaning of that result for that particular host.
  Green indicates a ping reply within a reasonable margin of the host's fastest
  response-time. Yellow indicates minor jitter in the host's latency, as can be
- expected due to noral usage of the uplink or internal buffers. Blue indicates
+ expected due to normal usage of the uplink or internal buffers. Blue indicates
  more serious delays, going over twice the minimum latency found for the host.
  Lastly, red indicates that the host did not reply to the echo request within
  the timeout period. This timeout is a function of the ping interval (by
@@ -48,7 +48,7 @@ The 'Network tree' window (toggled on by default) gives a quick overview of the
 
 The 'Hosts down' window (will appear when there are hosts in the list) shows
  the hosts that have failed to reply to two or more consecutive probes, until
- they reply once again.
+ they respond once again.
 
 While running the program, pressing the character associated with one of the
  monitored hosts will show a window with detailed information about that host.
@@ -69,7 +69,7 @@ The hosts to be monitored are specified in a textfile (by default ./targets in
  the CWD). One hostname or IP address can be specified per line, followed by an
  optional shortname for the host. Indentation by using spaces and paragraphs
  using empty lines can be used to indicate the connection structure between the
- hosts, aswell as identify groups of hosts. Each host will be visually linked
+ hosts, as well as identify groups of hosts. Each host will be visually linked
  to the most previous, lesser indented host in the configuration file. The
  shortnames (if configured) will be printed in this visual representation of
  the network tree. A special case is made for the following characters, to draw
@@ -88,8 +88,8 @@ At the top of the main.c source-file are some defines that you'd also might
  the INTERVAL set there divided by the number of hosts you're monitoring.
  Assuming normal landline connections, if you haven't had a reply in two
  seconds, you'll probably never get one, so monitoring 30 hosts with the
- standard 60 second interval should be fine. I recommend upping that if you'll
- be monitoring more.
+ standard 60 second interval should be fine. I recommend increasing that
+ interval if you'll be monitoring more.
 
 SECURITY
 
