@@ -19,7 +19,7 @@ This application monitors a set of internet hosts for latency problems and
  single-glance overview of the status of the monitored hosts, while still
  allowing the application to be used over an ssh link easily. When doing
  the latter, it would be suggested to run the program under screen. While
- the application doesn't terminate on a SIGHUP, it's visual output cannot
+ the application doesn't terminate on a SIGHUP, its visual output cannot
  be recovered otherwise.
 
 In the lower pane of the screen, each individual probe result is shown,
@@ -57,11 +57,11 @@ While running the program, pressing the character associated with one of the
  hosts. If not toggled on or off explicitly, the latter will be visible only
  when there are hosts in the list of unreachable hosts.
 
-In recognition of the desire to keep a backlog of probe data longer than
- the terminal backscroll, an HTML output facility has been added. Simply
- supply the program with a filename as its first (and only) commandline
- argument to have it output there. This file will be created or truncated at
- startup, after root privileges have been dropped.
+In recognition of the desire to keep a log of probe data longer than the
+ terminal backscroll, an HTML output facility has been added. Simply supply
+ the program with a filename as its first (and only) commandline argument
+ to have it output there. This file will be created or truncated at startup,
+ after root privileges have been dropped.
 
 CONFIGURATION
 
