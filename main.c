@@ -18,7 +18,7 @@
 #define GRIDMARK	'+'
 #define TARGETSFILE	"targets"
 #define INTERVAL	60
-#define BACKLOG		100		/* Number of intervals to keep full data from in memory */
+#define HISTLOG		100		/* Number of intervals to keep full data from in memory */
 #define SCROLLSIZE	6
 #define LINEBUF		512
 #define HOSTLEN		64
@@ -54,7 +54,7 @@ typedef struct passdata {
   pingdata *data;
 } passdata;
 
-passdata *backlog;
+passdata *histlog;
 int currlog = 0;
 
 typedef struct logdata {
@@ -181,22 +181,22 @@ int main(int argc, char *argv[]) {
 
   if (read_targets() == -1) exit(-3);
 
-  backlog = (passdata *)malloc(sizeof(passdata)*BACKLOG);
-  if (!backlog) {
-    printf("Error allocating memory for backlog; system out of memory?\n");
+  histlog = (passdata *)malloc(sizeof(passdata)*HISTLOG);
+  if (!histlog) {
+    printf("Error allocating memory for history log; system out of memory?\n");
     exit(-4);
   }
-  memset(backlog, 0, sizeof(passdata)*BACKLOG);
-  for (c = 0; c < BACKLOG; c++) {
-    backlog[c].data = (pingdata *)malloc(sizeof(pingdata)*ntargets);
-    if (!backlog[c].data) {
-      printf("Error allocating memory for backlog; system out of memory?\n");
+  memset(histlog, 0, sizeof(passdata)*HISTLOG);
+  for (c = 0; c < HISTLOG; c++) {
+    histlog[c].data = (pingdata *)malloc(sizeof(pingdata)*ntargets);
+    if (!histlog[c].data) {
+      printf("Error allocating memory for histlog; system out of memory?\n");
       exit(-5);
     }
-    memset(backlog[c].data, 0, sizeof(pingdata)*ntargets);
+    memset(histlog[c].data, 0, sizeof(pingdata)*ntargets);
   }
 
-  printf("Data storage for backlog initialised (%d bytes)\n", sizeof(passdata)*BACKLOG*sizeof(pingdata)*ntargets);
+  printf("Data storage for history log initialised (%d bytes)\n", sizeof(passdata)*HISTLOG*sizeof(pingdata)*ntargets);
 
   memset(&nexttv, 0, sizeof(struct timeval));
 
@@ -329,8 +329,8 @@ struct timeval check_timers(void) {
         ndown++;
         if (showdown) print_down();
       }
-      backlog[currlog].data[currtarget->num].rtt = -1;
-      backlog[currlog].data[currtarget->num].color = STATE_LOSS;
+      histlog[currlog].data[currtarget->num].rtt = -1;
+      histlog[currlog].data[currtarget->num].color = STATE_LOSS;
       currtarget->lastcolor = STATE_LOSS;
       if (currtarget->id == showinfo) print_info();
       if (htmlout) fputs("<TD class=\"l\">lost\n", htmlout);
@@ -355,8 +355,8 @@ struct timeval check_timers(void) {
       for (tp = targets; tp; tp = tp->next) ellsum += tp->rttlast - tp->rttmin;
       ell = ellsum / ntargets;
     }
-    if (++currlog == BACKLOG) currlog = 0;
-    backlog[currlog].time = now;
+    if (++currlog == HISTLOG) currlog = 0;
+    histlog[currlog].time = now;
   }
 
   waddch(grid, ' ');
@@ -395,9 +395,9 @@ struct timeval tvsub(struct timeval left, struct timeval right) {
     r.tv_sec--;
     r.tv_usec += 1000000;
   }
-  if (r.tv_sec < 0) {  // debug
-    fprintf(stderr, "Fatal error: negative result in timeval subtraction (%d)\n", r.tv_sec);
-    abort();
+  if (r.tv_sec < 0) {
+    r.tv_sec = 0;
+    r.tv_usec = 0;
   }
   return r;
 }
@@ -471,11 +471,11 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
     if (r > tp->rttmax) tp->rttmax = r;
     if (!tp->okcount) tp->okavg = tp->rttavg;
     ampl = tp->okavg - tp->rttmin;
-    backlog[currlog].data[tp->num].rtt = r;
+    histlog[currlog].data[tp->num].rtt = r;
 
     waddch(grid, '\b');
     if (tp->treecolor == STATE_LOSS) {
-      tp->downsince = time(NULL);
+      tp->downsince = 0;
       ndown--;
     }
     if ((pinground <= LEARNROUNDS) || (r <= tp->okavg+JITMULT*(ampl?ampl:1))) {
@@ -490,7 +490,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       tp->oksum += r;
       tp->okavg = tp->oksum/tp->okcount;
       if (htmlout) fprintf(htmlout, "<TD>%d\n", r);
-      backlog[currlog].data[tp->num].color = STATE_OK;
+      histlog[currlog].data[tp->num].color = STATE_OK;
     }
 //    else if ((r <= LAGMULT*tp->rttmin) || (r <= LAGMIN)) {
     else if (r <= tp->okavg+LAGMULT*(ampl?ampl:1)) {
@@ -502,7 +502,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       }
       tp->lastcolor = STATE_JIT;
       if (htmlout) fprintf(htmlout, "<TD class=\"j\">%d\n", r);
-      backlog[currlog].data[tp->num].color = STATE_JIT;
+      histlog[currlog].data[tp->num].color = STATE_JIT;
     }
     else {
       waddch(grid, GRIDMARK|COLOR_PAIR(STATE_LAG));
@@ -514,7 +514,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       }
       tp->lastcolor = STATE_LAG;
       if (htmlout) fprintf(htmlout, "<TD class=\"d\">%d\n", r);
-      backlog[currlog].data[tp->num].color = STATE_LAG;
+      histlog[currlog].data[tp->num].color = STATE_LAG;
     }
     update_screen('g');
     if (tp->beepmode == 1) beep();
@@ -532,7 +532,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
 
   if (tp->id == showinfo) print_info();
 
-  print_scroll("%c  %-30.30s %-15s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->hostname, tp->address, r, tp->okavg, ampl);
+  print_scroll("%c  %-30.30s %-15s  %4d ms  (baseline %3d Â± %2d)", tp->id, tp->hostname, tp->address, r, tp->okavg, ampl);
   update_screen('s');
 }
 
@@ -941,7 +941,7 @@ void print_info(void) {
   if (strlen(tp->hostname)+strlen(tp->address)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->hostname, tp->address);
   else snprintf(buf, 48, "%c %s", tp->id, tp->hostname);
   mvwaddstr(hostinfo, 1, 2, buf);
-  snprintf(buf, 48, "Overall statistics     | Last %d minutes", BACKLOG*INTERVAL/60);
+  snprintf(buf, 48, "Overall statistics     | Last %d minutes", HISTLOG*INTERVAL/60);
   mvwaddstr(hostinfo, 2, 2, buf);
   snprintf(buf, 48, "Baseline: %5d ± %-4d | %5d ± %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
   mvwaddstr(hostinfo, 3, 2, buf);
@@ -1024,20 +1024,20 @@ logdata *get_logdata(int num) {
   memset(&res, 0, sizeof(logdata));
   res.rttmin = -1;
 
-  for (i = 0; i < BACKLOG; i++) {
-    if (!backlog[i].data[num].color) {					// Might be current ping round
-      if ((++i == BACKLOG) || (!backlog[i].data[num].color)) break;	// or the end of the (used) backlog
+  for (i = 0; i < HISTLOG; i++) {
+    if (!histlog[i].data[num].color) {					// Might be current ping round
+      if ((++i == HISTLOG) || (!histlog[i].data[num].color)) break;	// or the end of the (used) histlog
     }
     res.count++;
-    if (backlog[i].data[num].color == STATE_LOSS) res.losscount++;
+    if (histlog[i].data[num].color == STATE_LOSS) res.losscount++;
     else {
-      totsum += backlog[i].data[num].rtt;
-      sqsum += powf(backlog[i].data[num].rtt,2);
-      if (backlog[i].data[num].rtt < res.rttmin) res.rttmin = backlog[i].data[num].rtt;
-      if (backlog[i].data[num].rtt > res.rttmax) res.rttmax = backlog[i].data[num].rtt;
-      if (backlog[i].data[num].color == STATE_LAG) res.delaycount++;
-      else if (backlog[i].data[num].color != STATE_JIT) {
-        oksum += backlog[i].data[num].rtt;
+      totsum += histlog[i].data[num].rtt;
+      sqsum += powf(histlog[i].data[num].rtt,2);
+      if (histlog[i].data[num].rtt < res.rttmin) res.rttmin = histlog[i].data[num].rtt;
+      if (histlog[i].data[num].rtt > res.rttmax) res.rttmax = histlog[i].data[num].rtt;
+      if (histlog[i].data[num].color == STATE_LAG) res.delaycount++;
+      else if (histlog[i].data[num].color != STATE_JIT) {
+        oksum += histlog[i].data[num].rtt;
         okcount++;
       }
     }
