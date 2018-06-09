@@ -1,5 +1,5 @@
 pinger: main.c
-	gcc -o pinger -g -lm -lncurses main.c
+	gcc -o pinger -g -lm -lncursesw main.c
 
 install: pinger
 	chown root pinger
