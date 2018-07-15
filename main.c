@@ -11,8 +11,9 @@
 #include <sys/select.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
+#include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
-#include <sys/prctl.h>		// debug
+//#include <sys/prctl.h>		// debug
 
 #define INITWAIT	5		/* Seconds to show initialisation messages before going visual */
 #define GRIDMARK	'+'
@@ -153,7 +154,7 @@ int main(int argc, char *argv[]) {
 
   setuid(getuid()); // Drop root privileges, we don't need them anymore.
 
-  prctl(PR_SET_DUMPABLE, 1); // debug
+//  prctl(PR_SET_DUMPABLE, 1); // debug
 
   pid = getpid();
 
@@ -532,7 +533,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
 
   if (tp->id == showinfo) print_info();
 
-  print_scroll("%c  %-30.30s %-15s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->hostname, tp->address, r, tp->okavg, ampl);
+  print_scroll("%c  %-30.30s %-15s  %4d ms  (baseline %3d Â± %2d)", tp->id, tp->hostname, tp->address, r, tp->okavg, ampl);
   update_screen('s');
 }
 
@@ -943,7 +944,7 @@ void print_info(void) {
   mvwaddstr(hostinfo, 1, 2, buf);
   snprintf(buf, 48, "Overall statistics     | Last %d minutes", HISTLOG*INTERVAL/60);
   mvwaddstr(hostinfo, 2, 2, buf);
-  snprintf(buf, 48, "Baseline: %5d � %-4d | %5d � %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
+  snprintf(buf, 48, "Baseline: %5d ± %-4d | %5d ± %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
   mvwaddstr(hostinfo, 3, 2, buf);
   snprintf(buf, 48, "Min:          %5d    | %5d", tp->rttmin, ld->rttmin);
   mvwaddstr(hostinfo, 4, 2, buf);
