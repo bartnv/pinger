@@ -1,12 +1,16 @@
 #include <stdio.h>
 #include <stdarg.h>
+#include <stdlib.h>
+#include <unistd.h>
 #include <errno.h>
 #include <time.h>
 #include <math.h>
 #include <string.h>
+#include <ctype.h>
 #include <ncurses.h>
 #include <netdb.h>
 #include <signal.h>
+#include <sys/types.h>
 #include <sys/time.h>
 #include <sys/select.h>
 #include <sys/ioctl.h>
@@ -581,7 +585,7 @@ int read_targets(void) {
 
   while (fgets(buf, LINEBUF, fp)) {
     for (rank = 0; buf[rank] == ' '; rank++);
-    if (!buf[rank]) return;
+    if (!buf[rank]) return -1;
     if (buf[rank] == '\n') {
       detached = 1;
       continue;
