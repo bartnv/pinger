@@ -38,16 +38,6 @@
 #define STATE_LAG	5
 #define STATE_LOSS	6
 
-#define HTMLHEAD1	"<HTML>\n<HEAD>\n<TITLE>Ping stats</TITLE>\n<STYLE type=\"text/css\">\n"
-#define HTMLHEAD2	"BODY { background-color: black; color: rgb(200,200,200) }\n"
-#define HTMLHEAD3	"TABLE { text-align: center }\n"
-#define HTMLHEAD8	"TABLE#results TH { color: black; background-color: rgb(200,200,200); width: 1em }\n"
-#define HTMLHEAD4	"TABLE#results TD { color: black; background-color: green; width: 1em }\n"
-#define HTMLHEAD5	"TABLE#results TD.j { background-color: yellow }\n"
-#define HTMLHEAD6	"TABLE#results TD.d { background-color: blue }\n"
-#define HTMLHEAD7	"TABLE#results TD.l { background-color: red }\n"
-#define HTMLHEAD9	"</STYLE></HEAD>\n\n<BODY>\n"
-
 typedef struct pingdata {
   unsigned int rtt;
   int color;
@@ -117,8 +107,6 @@ struct timeval nexttv, tvinterval;
 
 WINDOW *header, *footer, *status, *grid, *scroller, *hostinfo, *tree, *downlist;
 
-FILE *htmlout = NULL;
-
 int open_socket(void);
 struct timeval check_timers(void);
 int tvcmp(struct timeval, struct timeval);
@@ -166,23 +154,6 @@ int main(int argc, char *argv[]) {
   signal(SIGTERM, do_exit);
 //  signal(SIGWINCH, sig_winch); // while debugging
 
-  if (argc == 2) {
-    printf("HTML output file: %s\n", argv[1]);
-    if (!(htmlout = fopen(argv[1], "w"))) {
-      perror("fopen()");
-      exit(-2);
-    }
-    fputs(HTMLHEAD1, htmlout);
-    fputs(HTMLHEAD2, htmlout);
-    fputs(HTMLHEAD3, htmlout);
-    fputs(HTMLHEAD4, htmlout);
-    fputs(HTMLHEAD5, htmlout);
-    fputs(HTMLHEAD6, htmlout);
-    fputs(HTMLHEAD7, htmlout);
-    fputs(HTMLHEAD8, htmlout);
-    fputs(HTMLHEAD9, htmlout);
-  }
-
   if (read_targets() == -1) exit(-3);
 
   histlog = (passdata *)malloc(sizeof(passdata)*HISTLOG);
@@ -220,12 +191,6 @@ int main(int argc, char *argv[]) {
     sleep(1);
   }
   printf("\b0\n");
-
-  if (htmlout) {
-    fputs("<HR>\n<TABLE id=\"results\">\n<THEAD>\n<TR><TH>Time\n", htmlout);
-    for (tp = targets; tp; tp = tp->next) fprintf(htmlout, "<TH title=\"%s\">%c\n", tp->hostname, tp->id);
-    fputs("<TBODY>\n", htmlout);
-  }
 
   start_curses();
 
@@ -337,7 +302,6 @@ struct timeval check_timers(void) {
       histlog[currlog].data[currtarget->num].color = STATE_LOSS;
       currtarget->lastcolor = STATE_LOSS;
       if (currtarget->id == showinfo) print_info();
-      if (htmlout) fputs("<TD class=\"l\">lost\n", htmlout);
     }
     currtarget = currtarget->next;
   }
@@ -347,14 +311,6 @@ struct timeval check_timers(void) {
     snprintf(timebuf, 9, "\n[%02d:%02d] ", currtm->tm_hour, currtm->tm_min);
     waddstr(grid, timebuf);
     if (showdown && ndown) print_down();
-    if (htmlout) {
-      if (!(pinground%30)) {
-        fputs("<TR>\n<TH>Time\n", htmlout);
-        for (tp = targets; tp; tp = tp->next) fprintf(htmlout, "<TH title=\"%s\">%c\n", tp->hostname, tp->id);
-      }
-      fflush(htmlout);
-      fprintf(htmlout, "<TR><TD>%02d:%02d\n", currtm->tm_hour, currtm->tm_min);
-    }
     if (pinground > 1) {
       for (tp = targets; tp; tp = tp->next) ellsum += tp->rttlast - tp->rttmin;
       ell = ellsum / ntargets;
@@ -493,7 +449,6 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
       tp->okcount++;
       tp->oksum += r;
       tp->okavg = tp->oksum/tp->okcount;
-      if (htmlout) fprintf(htmlout, "<TD>%d\n", r);
       histlog[currlog].data[tp->num].color = STATE_OK;
     }
 //    else if ((r <= LAGMULT*tp->rttmin) || (r <= LAGMIN)) {
@@ -505,7 +460,6 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
         print_tree();
       }
       tp->lastcolor = STATE_JIT;
-      if (htmlout) fprintf(htmlout, "<TD class=\"j\">%d\n", r);
       histlog[currlog].data[tp->num].color = STATE_JIT;
     }
     else {
@@ -517,7 +471,6 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
         print_tree();
       }
       tp->lastcolor = STATE_LAG;
-      if (htmlout) fprintf(htmlout, "<TD class=\"d\">%d\n", r);
       histlog[currlog].data[tp->num].color = STATE_LAG;
     }
     update_screen('g');
@@ -581,8 +534,6 @@ int read_targets(void) {
   memset(&hints, 0, sizeof(hints));
   hints.ai_family = PF_INET;
 
-  if (htmlout) fputs("<TABLE><TR><TD>ID<TD>Hostname<TD>IP address<TD>Comment\n", htmlout);
-
   while (fgets(buf, LINEBUF, fp)) {
     for (rank = 0; buf[rank] == ' '; rank++);
     if (!buf[rank]) return -1;
@@ -642,15 +593,11 @@ int read_targets(void) {
 
     if (t->comment) {
       printf("%c %s (%s) %s\n", t->id, t->hostname, t->address, t->comment);
-      if (htmlout) fprintf(htmlout, "<TR><TD>%c<TD>%s<TD>%s<TD>%s\n", t->id, t->hostname, t->address, t->comment);
     }
     else {
       printf("%c %s (%s)\n", t->id, t->hostname, t->address);
-      if (htmlout) fprintf(htmlout, "<TR><TD>%c<TD>%s<TD>%s\n", t->id, t->hostname, t->address);
     }
   }
-
-  if (htmlout) fputs("</TABLE>\n", htmlout);
 
   if (!ntargets) return -1;
 
@@ -815,7 +762,7 @@ void draw_border(WINDOW *win, char *title) {
 
   wmove(win, 0, (x-c)/2);
   waddstr(win, title);
-}  
+}
 
 void print_scroll(char *fmt, ...) {
   char buf[cols+1];
@@ -1107,19 +1054,6 @@ void do_exit(int sig) {
   target *tp;
 
   close(sock);
-
-  if (htmlout) {
-    fputs("</TABLE>\n<HR>\n", htmlout);
-    for (tp = targets; tp; tp = tp->next) {
-      fputs("<P>\n", htmlout);
-      fprintf(htmlout, "%c %s (%s) %s<BR>\n", tp->id, tp->hostname, tp->address, tp->comment?tp->comment:"");
-      fprintf(htmlout, "Min: %d / Avg: %d / Max: %d / Last: %d<BR>\n", tp->rttmin, tp->rttavg, tp->rttmax, tp->rttlast);
-      fprintf(htmlout, "Packets lost: %d (%d%%) / Packets delayed: %d (%d%%)\n", tp->losscount,
-        tp->losscount*100/pinground, tp->delaycount, tp->delaycount*100/pinground);
-      fputs("</P>", htmlout);
-    }
-    fputs("\n</BODY>\n</HTML>\n", htmlout);
-  }
 
   noraw();
   echo();
