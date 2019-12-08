@@ -7,6 +7,7 @@
 #include <math.h>
 #include <string.h>
 #include <ctype.h>
+#include <locale.h>
 #include <ncurses.h>
 #include <netdb.h>
 #include <signal.h>
@@ -16,27 +17,28 @@
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netinet/ip_icmp.h>
+#include <netinet/icmp6.h>
 #include <sys/prctl.h>		// debug
 
-#define INITWAIT	5		/* Seconds to show initialisation messages before going visual */
-#define GRIDMARK	'+'
+#define INITWAIT       5		/* Seconds to show initialisation messages before going visual */
+#define GRIDMARK    '+'
 #define TARGETSFILE	"targets"
-#define INTERVAL	60
-#define HISTLOG		100		/* Number of intervals to keep full data from in memory */
-#define SCROLLSIZE	6
-#define LINEBUF		512
-#define HOSTLEN		64
-#define MAXPACKET	4096		/* max packet size */
+#define INTERVAL	    60
+#define HISTLOG		   100		/* Number of intervals to keep full data from in memory */
+#define SCROLLSIZE    10
+#define LINEBUF		   512
+#define HOSTLEN		    64
+#define MAXPACKET	  4096		/* max packet size */
 #define IDSEQUENCE	"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-#define LEARNROUNDS	5		/* number of INTERVALS to wait before marking any result as lagged */
-#define JITMULT		3		/* Sensitive: 2 */
-#define LAGMULT		10		/* Sensitive: 10 */
-#define LAGMIN		8		/* Currently unused */
+#define LEARNROUNDS    5		/* number of INTERVALS to wait before marking any result as lagged */
+#define JITMULT		     3		/* Sensitive: 2 */
+#define LAGMULT		    10		/* Sensitive: 10 */
+#define LAGMIN		     8		/* Currently unused */
 
-#define STATE_OK	3
-#define STATE_JIT	4
-#define STATE_LAG	5
-#define STATE_LOSS	6
+#define STATE_OK	     3
+#define STATE_JIT	     4
+#define STATE_LAG	     5
+#define STATE_LOSS	   6
 
 typedef struct pingdata {
   unsigned int rtt;
@@ -62,12 +64,18 @@ typedef struct logdata {
   float stddev;
 } logdata;
 
+struct address {
+  char print[40];
+  char name[HOSTLEN+1];
+  int family;
+  struct sockaddr_storage *addr;
+};
+
 typedef struct target {
   int num;
   char id;
-  char hostname[HOSTLEN+1];
-  char address[16];
-  struct sockaddr_in *addr;
+  char name[HOSTLEN+1];
+  struct address *addrs[10];
   int rank;
   int detached;
   int lastcolor;
@@ -93,7 +101,7 @@ typedef struct target {
 target *targets;
 
 int pid;
-int sock;
+int sock4, sock6;
 int ntargets = 0, ndown = 0;
 int pinground = 0;
 int rows, cols, gotwinch = 0;
@@ -107,13 +115,13 @@ struct timeval nexttv, tvinterval;
 
 WINDOW *header, *footer, *status, *grid, *scroller, *hostinfo, *tree, *downlist;
 
-int open_socket(void);
+int open_sockets(void);
 struct timeval check_timers(void);
 int tvcmp(struct timeval, struct timeval);
 struct timeval tvsub(struct timeval, struct timeval);
 struct timeval tvadd(struct timeval, struct timeval);
 void read_socket(int);
-void print_packet(char *, int, struct sockaddr_in *);
+void print_packet(char *, int, struct sockaddr_storage *);
 char *print_type(int);
 int read_targets(void);
 void send_ping(target *);
@@ -141,7 +149,7 @@ int main(int argc, char *argv[]) {
   fd_set fdmask;
   struct timeval timeout;
 
-  if (open_socket() == -1) exit(-1);
+  if (open_sockets() == -1) exit(-1);
 
   setuid(getuid()); // Drop root privileges, we don't need them anymore.
 
@@ -170,18 +178,15 @@ int main(int argc, char *argv[]) {
     }
     memset(histlog[c].data, 0, sizeof(pingdata)*ntargets);
   }
-
   printf("Data storage for history log initialised (%d bytes)\n", sizeof(passdata)*HISTLOG*sizeof(pingdata)*ntargets);
 
   memset(&nexttv, 0, sizeof(struct timeval));
-
   msinterval = INTERVAL*1000/ntargets;
   tvinterval.tv_sec = INTERVAL/ntargets;
   tvinterval.tv_usec = INTERVAL*1000000/ntargets%1000000;
 
   printf("Ping timeout is %d milliseconds\n", msinterval);
   printf("Ping throughput is %d pings per minute\n", INTERVAL/60*ntargets);
-
   printf("Initialisation complete, starting in %d", INITWAIT?INITWAIT:1);
   fflush(stdout);
   sleep(1);
@@ -199,17 +204,19 @@ int main(int argc, char *argv[]) {
 
     FD_ZERO(&fdmask);
     FD_SET(0, &fdmask);
-    FD_SET(sock, &fdmask);
+    FD_SET(sock4, &fdmask);
+    FD_SET(sock6, &fdmask);
 
     timeout = check_timers();
 
-    r = select(sock+1, &fdmask, 0, 0, &timeout);
+    r = select(sock6+1, &fdmask, 0, 0, &timeout);
     if (r == -1) {
       if (errno == EINTR) continue;
       perror("select()");
       abort();	// debug
     }
-    if (FD_ISSET(sock, &fdmask)) read_socket(sock);
+    if (FD_ISSET(sock4, &fdmask)) read_socket(sock4);
+    if (FD_ISSET(sock6, &fdmask)) read_socket(sock6);
     if (FD_ISSET(0, &fdmask)) {
       if ((r = getc(stdin)) == EOF) {
         perror("getc(stdin)");
@@ -252,14 +259,12 @@ int main(int argc, char *argv[]) {
   }
 }
 
-int open_socket(void) {
-  struct protoent *proto = NULL;
-
-  if (!(proto = getprotobyname("icmp"))) {
-    perror("getprotobyname()");
+int open_sockets(void) {
+  if ((sock4 = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)) < 0) {
+    perror("socket()");
     return -1;
   }
-  if ((sock = socket(AF_INET, SOCK_RAW, proto->p_proto)) < 0) {
+  if ((sock6 = socket(AF_INET6, SOCK_RAW, IPPROTO_ICMPV6)) < 0) {
     perror("socket()");
     return -1;
   }
@@ -287,7 +292,7 @@ struct timeval check_timers(void) {
       waddch(grid, '\b');
       waddch(grid, GRIDMARK|COLOR_PAIR(STATE_LOSS));
       wattron(scroller, COLOR_PAIR(STATE_LOSS));
-      print_scroll("%c  %-30.30s %-15s >%4d ms  (timeout)", currtarget->id, currtarget->hostname, currtarget->address,
+      print_scroll("%c  %-40.40s %-40s >%4d ms  (timeout)", currtarget->id, currtarget->name, currtarget->addrs[0]->print,
         msinterval);
       currtarget->losscount++;
       if (!currtarget->beepmode) beep();
@@ -377,7 +382,7 @@ struct timeval tvadd(struct timeval left, struct timeval right) {
 
 void read_socket(int sock) {
   char packet[MAXPACKET];
-  struct sockaddr_in from;
+  struct sockaddr_storage from;
   int r = 0, len = sizeof(packet), fromlen = sizeof(from);
 
   r = recvfrom(sock, packet, len, 0, (struct sockaddr *)&from, &fromlen);
@@ -387,45 +392,75 @@ void read_socket(int sock) {
   if ((r == -1) && (errno != EINTR)) perror("recvfrom()");
 }
 
-void print_packet(char *packet, int len, struct sockaddr_in *from) {
-  int r, hlen, ampl;
-  long *lp = (long *) packet;
+int sockaddr_equal(struct sockaddr_storage *a, struct sockaddr_storage *b) {
+  if (a->ss_family != b->ss_family) return 0;
+
+  switch (a->ss_family) {
+    case AF_INET:
+    {
+      struct sockaddr_in *a4 = (struct sockaddr_in *) a;
+      struct sockaddr_in *b4 = (struct sockaddr_in *) b;
+      return a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+    }
+    case AF_INET6:
+    {
+      struct sockaddr_in6 *a6 = (struct sockaddr_in6 *) a;
+      struct sockaddr_in6 *b6 = (struct sockaddr_in6 *) b;
+      return memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
+    }
+    default:
+      exit(-1);
+  }
+}
+
+const char *sockaddr_print(struct sockaddr_storage *sas) {
+  static char buf[INET6_ADDRSTRLEN];
+  void *addr = (sas->ss_family==AF_INET?(void *)&((struct sockaddr_in *)sas)->sin_addr:(void *)&((struct sockaddr_in6 *)sas)->sin6_addr);
+  return inet_ntop(sas->ss_family, addr, buf, INET6_ADDRSTRLEN);
+}
+
+void print_packet(char *packet, int len, struct sockaddr_storage *from) {
+  int r, ampl, seq;
+  long *lp = (long *)packet;
   target *tp;
-  struct ip *ip;
-  struct icmp *icp;
   struct timeval *packtv, currtv;
 
-  ip = (struct ip *) packet;
-  hlen = ip->ip_hl << 2;
-  if (len < hlen + ICMP_MINLEN) return;
-
-  len -= hlen;
-  icp = (struct icmp *)(packet + hlen);
-
-  if (icp->icmp_id != pid) return;
-
-  if ((icp->icmp_type != 0) || (icp->icmp_code != 0)) {
-    if (icp->icmp_type != 8) print_scroll("%d bytes from %s: icmp_type=%d (%s) icmp_code=%d icmp_id=%d", len,
-      inet_ntoa(from->sin_addr), icp->icmp_type, print_type(icp->icmp_type), icp->icmp_code, icp->icmp_id);
-    return;
+  if (from->ss_family == AF_INET) {
+    struct ip *ip = (struct ip *)packet;
+    int hlen = ip->ip_hl << 2;
+    len -= hlen;
+    // if (len < hlen + ICMP_MINLEN) return;
+    struct icmp *icp = (struct icmp *)(packet + hlen);
+    if (ntohs(icp->icmp_id) != pid) return;
+    seq = ntohs(icp->icmp_seq);
+    if ((icp->icmp_type != 0) || (icp->icmp_code != 0)) return;
+    packtv = (struct timeval *)icp->icmp_data;
+  }
+  else {
+    struct icmp6_hdr *icp = (struct icmp6_hdr *)packet;
+    // print_scroll("IPv6 packet from %s with type %d / code %d / id %d / seq %d", sockaddr_print(from), icp->icmp6_type, icp->icmp6_code, ntohs(icp->icmp6_id), ntohs(icp->icmp6_seq));
+    if (ntohs(icp->icmp6_id) != pid) return;
+    seq = ntohs(icp->icmp6_seq);
+    if ((icp->icmp6_type != ICMP6_ECHO_REPLY) || (icp->icmp6_code != 0)) return;
+    packtv = (struct timeval *)&icp->icmp6_dataun;
   }
 
   for (tp = targets; tp; tp = tp->next) {
-    if (!strcmp(tp->address, inet_ntoa(from->sin_addr))) break;
+    if (sockaddr_equal(tp->addrs[0]->addr, (struct sockaddr_storage *)from)) break;
+    // if (!strcmp(tp->addrs[0]->print, inet_ntoa(from->sin_addr))) break;
   }
   if (!tp) return;
 
   gettimeofday(&currtv, NULL);
-  packtv = (struct timeval *)icp->icmp_data;
   currtv = tvsub(currtv, *packtv);
   r = currtv.tv_sec * 1000;
   r += currtv.tv_usec / 1000;
 
-  if ((tp == currtarget) && (icp->icmp_seq == tp->waitping)) {
+  if ((tp == currtarget) && (seq == tp->waitping)) {
     tp->waitping = 0;
     tp->rttlast = r;
     tp->rttsum += r;
-    tp->rttavg = tp->rttsum / (icp->icmp_seq - tp->losscount);
+    tp->rttavg = tp->rttsum / (seq - tp->losscount);
     tp->sqsum += powf(r,2);
     if (r < tp->rttmin) tp->rttmin = r;
     if (r > tp->rttmax) tp->rttmax = r;
@@ -476,9 +511,9 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
     update_screen('g');
     if (tp->beepmode == 1) beep();
   }
-  else if (icp->icmp_seq != tp->waitping) {
+  else if (seq != tp->waitping) {
     wattron(scroller, COLOR_PAIR(STATE_LOSS));
-    print_scroll("%c  %-30.30s %-15s %5d ms  (out of sync)", currtarget->id, currtarget->hostname, currtarget->address, r);
+    print_scroll("%c  %-40.40s %-40s %5d ms  (out of sync)", currtarget->id, currtarget->addrs[0]->name, currtarget->addrs[0]->print, r);
     return;
   }
   else {
@@ -489,7 +524,7 @@ void print_packet(char *packet, int len, struct sockaddr_in *from) {
 
   if (tp->id == showinfo) print_info();
 
-  print_scroll("%c  %-30.30s %-15s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->hostname, tp->address, r, tp->okavg, ampl);
+  print_scroll("%c  %-40.40s %-40s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->addrs[0]->name, tp->addrs[0]->print, r, tp->okavg, ampl);
   update_screen('s');
 }
 
@@ -520,7 +555,7 @@ char *print_type(int t) {
 }
 
 int read_targets(void) {
-  int r, rank, detached = 0;
+  int i, r, rank, detached = 0;
   char buf[LINEBUF+1], *tmp2;
   target *t, *tmp;
   struct addrinfo hints, *res = NULL;
@@ -532,7 +567,8 @@ int read_targets(void) {
   }
 
   memset(&hints, 0, sizeof(hints));
-  hints.ai_family = PF_INET;
+  hints.ai_family = PF_UNSPEC;
+  hints.ai_socktype = SOCK_RAW;
 
   while (fgets(buf, LINEBUF, fp)) {
     for (rank = 0; buf[rank] == ' '; rank++);
@@ -551,13 +587,32 @@ int read_targets(void) {
       return -1;
     }
     memset(t, 0, sizeof(target));
-    if (!(t->addr = (struct sockaddr_in *)malloc(sizeof(struct sockaddr_in)+1))) {
-      perror("malloc()");
-      return -1;
-    }
-    if ((r = getnameinfo(res->ai_addr, sizeof(struct sockaddr), t->hostname, HOSTLEN, NULL,0,0))) {
-      fprintf(stderr, "- %s getnameinfo(): %s\n", &buf[rank], gai_strerror(r));
-      continue;
+    strncpy(t->name, &buf[rank], HOSTLEN);
+    i = 0;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next, i++) {
+      if (i == 10) {
+        fprintf(stderr, "- %s has more than 10 addresses, skipping...\n", &buf[rank]);
+        break;
+      }
+      if (!(t->addrs[i] = (struct address *)malloc(sizeof(struct address)))) {
+        perror("malloc()");
+        return -1;
+      }
+      memset(t->addrs[i], 0, sizeof(struct address));
+      t->addrs[i]->family = ai->ai_family;
+      if (!(t->addrs[i]->addr = (struct sockaddr_storage *)malloc(sizeof(struct sockaddr_storage)))) {
+        perror("malloc()");
+        return -1;
+      }
+      memcpy(t->addrs[i]->addr, ai->ai_addr, ai->ai_addrlen);
+      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->addrs[i]->print, 40, NULL, 0, NI_NUMERICHOST))) {
+        fprintf(stderr, "- %s getnameinfo(): %s\n", &buf[rank], gai_strerror(r));
+        continue;
+      }
+      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->addrs[i]->name, HOSTLEN, NULL,0,0))) {
+        fprintf(stderr, "- %s getnameinfo(): %s\n", t->addrs[i]->print, gai_strerror(r));
+        strcpy(t->addrs[i]->name, "<none>");
+      }
     }
     t->num = ntargets;
     t->id = IDSEQUENCE[ntargets];
@@ -565,9 +620,6 @@ int read_targets(void) {
     t->rank = rank;
     t->detached = detached;
     if (detached) ndetach++;
-    memset(t->addr, 0, sizeof(struct sockaddr_in));
-    memcpy(t->addr, res->ai_addr, sizeof(struct sockaddr_in));
-    strncpy(t->address, inet_ntoa(t->addr->sin_addr), 15);
     t->rttmin = -1;
     t->lastcolor = 99;
     tmp2 = strtok(NULL, "\n");
@@ -592,10 +644,13 @@ int read_targets(void) {
     detached = 0;
 
     if (t->comment) {
-      printf("%c %s (%s) %s\n", t->id, t->hostname, t->address, t->comment);
+      printf("%c %s (%s):\n", t->id, t->name, t->comment);
     }
     else {
-      printf("%c %s (%s)\n", t->id, t->hostname, t->address);
+      printf("%c %s:\n", t->id, t->name);
+    }
+    for (int i = 0; t->addrs[i]; i++) {
+      printf("- %s (%s)\n", t->addrs[i]->print, t->addrs[i]->name);
     }
   }
 
@@ -605,22 +660,37 @@ int read_targets(void) {
 }
 
 void send_ping(target *t) {
-  int len = sizeof(struct icmp) + sizeof(struct timeval);
-  u_char packet[len+1];
-  struct icmp *icp = (struct icmp *) packet;
-  struct timeval *tp = (struct timeval *) &packet[8];
+  int fd, len = sizeof(struct icmp6_hdr) + sizeof(struct timeval);
+  u_char packet[len];
+  struct timeval *tp;
 
-  icp->icmp_type = ICMP_ECHO;
-  icp->icmp_code = 0;
-  icp->icmp_id = pid;
-  icp->icmp_cksum = 0;
-  icp->icmp_seq = pinground;
+  if (t->addrs[0]->family == AF_INET) {
+    fd = sock4;
+    len = sizeof(struct icmp) + sizeof(struct timeval);
+    struct icmp *icp = (struct icmp *)packet;
+    tp = (struct timeval *)&packet[8];
 
-  gettimeofday(tp, NULL);
+    icp->icmp_type = ICMP_ECHO;
+    icp->icmp_code = 0;
+    icp->icmp_id = htons(pid);
+    icp->icmp_seq = htons(pinground);
+    gettimeofday(tp, NULL);
+    icp->icmp_cksum = 0;
+    icp->icmp_cksum = calc_checksum(icp, len);
+  }
+  else {
+    fd = sock6;
+    struct icmp6_hdr *icp = (struct icmp6_hdr *)packet;
+    tp = (struct timeval *)&packet[sizeof(struct icmp6_hdr)];
 
-  icp->icmp_cksum = calc_checksum(icp, len);
+    icp->icmp6_type = ICMP6_ECHO_REQUEST;
+    icp->icmp6_code = 0;
+    icp->icmp6_id = htons(pid);
+    icp->icmp6_seq = htons(pinground);
+    gettimeofday(tp, NULL);
+  }
 
-  if ((sendto(sock, packet, len, 0, (struct sockaddr *)t->addr, sizeof(struct sockaddr))) <= 0) perror("sendto()");
+  if ((sendto(fd, packet, len, 0, (struct sockaddr *)t->addrs[0]->addr, sizeof(struct sockaddr_storage))) <= 0) perror("sendto()");
 }
 
 u_short calc_checksum(struct icmp *addr, int len) {
@@ -649,6 +719,9 @@ u_short calc_checksum(struct icmp *addr, int len) {
 
 void start_curses(void) {
   int c, x, y;
+
+  setlocale(LC_ALL, "");
+  setenv("NCURSES_NO_UTF8_ACS", "1", 0);
 
   initscr();
   cbreak();
@@ -889,12 +962,12 @@ void print_info(void) {
 
   stddev = sqrtf(tp->sqsum/pinground-pow(tp->rttavg,2));
 
-  if (strlen(tp->hostname)+strlen(tp->address)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->hostname, tp->address);
-  else snprintf(buf, 48, "%c %s", tp->id, tp->hostname);
+  if (strlen(tp->name)+strlen(tp->addrs[0]->print)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->name, tp->addrs[0]->print);
+  else snprintf(buf, 48, "%c %s", tp->id, tp->name);
   mvwaddstr(hostinfo, 1, 2, buf);
   snprintf(buf, 48, "Overall statistics     | Last %d minutes", HISTLOG*INTERVAL/60);
   mvwaddstr(hostinfo, 2, 2, buf);
-  snprintf(buf, 48, "Baseline: %5d � %-4d | %5d � %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
+  snprintf(buf, 48, "Baseline: %5d ± %-4d | %5d ± %-4d", tp->okavg, tp->okavg-tp->rttmin, ld->okavg, ld->okavg-ld->rttmin);
   mvwaddstr(hostinfo, 3, 2, buf);
   snprintf(buf, 48, "Min:          %5d    | %5d", tp->rttmin, ld->rttmin);
   mvwaddstr(hostinfo, 4, 2, buf);
@@ -932,7 +1005,7 @@ void print_down(void) {
   }
   for (tp = targets; tp; tp = tp->next) {
     if (tp->treecolor == STATE_LOSS) {
-      snprintf(buf, 48, "%c %-25.25s %s", tp->id, tp->hostname, itodur((int)time(NULL)-tp->downsince));
+      snprintf(buf, 48, "%c %-25.25s %s", tp->id, tp->name, itodur((int)time(NULL)-tp->downsince));
       mvwaddstr(downlist, line++, 2, buf);
     }
   }
@@ -1053,7 +1126,8 @@ char *itodur(int digits) {
 void do_exit(int sig) {
   target *tp;
 
-  close(sock);
+  close(sock4);
+  close(sock6);
 
   noraw();
   echo();
