@@ -64,18 +64,12 @@ typedef struct logdata {
   float stddev;
 } logdata;
 
-struct address {
-  char print[40];
-  char name[HOSTLEN+1];
-  int family;
-  struct sockaddr_storage *addr;
-};
-
 typedef struct target {
   int num;
   char id;
   char name[HOSTLEN+1];
-  struct address *addrs[10];
+  char ipstr[INET6_ADDRSTRLEN+1];
+  struct sockaddr_storage *addr;
   int rank;
   int detached;
   int lastcolor;
@@ -273,7 +267,7 @@ int open_sockets(void) {
 
 struct timeval check_timers(void) {
   int ellsum = 0;
-  static int ell = 0;
+  static int ell = 0, currid = 0;
   char timebuf[10];
   target *tp;
   time_t now;
@@ -292,7 +286,7 @@ struct timeval check_timers(void) {
       waddch(grid, '\b');
       waddch(grid, GRIDMARK|COLOR_PAIR(STATE_LOSS));
       wattron(scroller, COLOR_PAIR(STATE_LOSS));
-      print_scroll("%c  %-40.40s %-40s >%4d ms  (timeout)", currtarget->id, currtarget->name, currtarget->addrs[0]->print,
+      print_scroll("%c  %-40.40s %-40s >%4d ms  (timeout)", currtarget->id, currtarget->name, currtarget->ipstr,
         msinterval);
       currtarget->losscount++;
       if (!currtarget->beepmode) beep();
@@ -324,8 +318,9 @@ struct timeval check_timers(void) {
     histlog[currlog].time = now;
   }
 
-  waddch(grid, ' ');
+  if (currtarget->id != currid) waddch(grid, ' ');
   waddch(grid, GRIDMARK);
+  currid = currtarget->id;
   currtarget->waitping = pinground;
 
   print_status("Ping round %d / Monitoring %d hosts / Estimated local latency: %d ms", pinground, ntargets, ell);
@@ -442,11 +437,11 @@ void print_packet(char *packet, int len, struct sockaddr_storage *from) {
     if (ntohs(icp->icmp6_id) != pid) return;
     seq = ntohs(icp->icmp6_seq);
     if ((icp->icmp6_type != ICMP6_ECHO_REPLY) || (icp->icmp6_code != 0)) return;
-    packtv = (struct timeval *)&icp->icmp6_dataun;
+    packtv = (struct timeval *)&(icp->icmp6_data16[2]); // skip the id and seq fields which are part of the ICMP6 data
   }
 
   for (tp = targets; tp; tp = tp->next) {
-    if (sockaddr_equal(tp->addrs[0]->addr, (struct sockaddr_storage *)from)) break;
+    if (sockaddr_equal(tp->addr, (struct sockaddr_storage *)from)) break;
     // if (!strcmp(tp->addrs[0]->print, inet_ntoa(from->sin_addr))) break;
   }
   if (!tp) return;
@@ -513,7 +508,7 @@ void print_packet(char *packet, int len, struct sockaddr_storage *from) {
   }
   else if (seq != tp->waitping) {
     wattron(scroller, COLOR_PAIR(STATE_LOSS));
-    print_scroll("%c  %-40.40s %-40s %5d ms  (out of sync)", currtarget->id, currtarget->addrs[0]->name, currtarget->addrs[0]->print, r);
+    print_scroll("%c  %-40.40s %-40s %5d ms  (out of sync)", currtarget->id, currtarget->name, currtarget->ipstr, r);
     return;
   }
   else {
@@ -524,7 +519,7 @@ void print_packet(char *packet, int len, struct sockaddr_storage *from) {
 
   if (tp->id == showinfo) print_info();
 
-  print_scroll("%c  %-40.40s %-40s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->addrs[0]->name, tp->addrs[0]->print, r, tp->okavg, ampl);
+  print_scroll("%c  %-40.40s %-40s  %4d ms  (baseline %3d ± %2d)", tp->id, tp->name, tp->ipstr, r, tp->okavg, ampl);
   update_screen('s');
 }
 
@@ -555,7 +550,7 @@ char *print_type(int t) {
 }
 
 int read_targets(void) {
-  int i, r, rank, detached = 0;
+  int i, r, rank, count = 0, detached = 0;
   char buf[LINEBUF+1], *tmp2;
   target *t, *tmp;
   struct addrinfo hints, *res = NULL;
@@ -582,76 +577,69 @@ int read_targets(void) {
       fprintf(stderr, "- %s getaddrinfo(): %s\n", &buf[rank], gai_strerror(r));
       continue;
     }
-    if (!(t = (target *)malloc(sizeof(target)))) {
-      perror("malloc()");
-      return -1;
-    }
-    memset(t, 0, sizeof(target));
-    strncpy(t->name, &buf[rank], HOSTLEN);
     i = 0;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next, i++) {
       if (i == 10) {
         fprintf(stderr, "- %s has more than 10 addresses, skipping...\n", &buf[rank]);
         break;
       }
-      if (!(t->addrs[i] = (struct address *)malloc(sizeof(struct address)))) {
+
+      if (!(t = (target *)malloc(sizeof(target)))) {
         perror("malloc()");
         return -1;
       }
-      memset(t->addrs[i], 0, sizeof(struct address));
-      t->addrs[i]->family = ai->ai_family;
-      if (!(t->addrs[i]->addr = (struct sockaddr_storage *)malloc(sizeof(struct sockaddr_storage)))) {
+      memset(t, 0, sizeof(target));
+      if (!(t->addr = (struct sockaddr_storage *)malloc(sizeof(struct sockaddr_storage)))) {
         perror("malloc()");
         return -1;
       }
-      memcpy(t->addrs[i]->addr, ai->ai_addr, ai->ai_addrlen);
-      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->addrs[i]->print, 40, NULL, 0, NI_NUMERICHOST))) {
+      memset(t->addr, 0, sizeof(struct sockaddr_storage));
+      memcpy(t->addr, ai->ai_addr, sizeof(struct sockaddr_storage));
+      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->ipstr, 40, NULL, 0, NI_NUMERICHOST))) {
         fprintf(stderr, "- %s getnameinfo(): %s\n", &buf[rank], gai_strerror(r));
         continue;
       }
-      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->addrs[i]->name, HOSTLEN, NULL,0,0))) {
-        fprintf(stderr, "- %s getnameinfo(): %s\n", t->addrs[i]->print, gai_strerror(r));
-        strcpy(t->addrs[i]->name, "<none>");
+      if ((r = getnameinfo(ai->ai_addr, ai->ai_addrlen, t->name, HOSTLEN, NULL,0,0))) {
+        fprintf(stderr, "- %s getnameinfo(): %s\n", t->ipstr, gai_strerror(r));
+        snprintf(t->name, HOSTLEN, "(%s)", &buf[rank]);
       }
-    }
-    t->num = ntargets;
-    t->id = IDSEQUENCE[ntargets];
-    if (!t->id) t->id = '?';
-    t->rank = rank;
-    t->detached = detached;
-    if (detached) ndetach++;
-    t->rttmin = -1;
-    t->lastcolor = 99;
-    tmp2 = strtok(NULL, "\n");
-    if (tmp2) {
-      if (!(t->comment = (char *)malloc(strlen(tmp2)+1))) {
-        perror("malloc()");
-        return -1;
+      t->num = ntargets;
+      t->id = IDSEQUENCE[count];
+      if (!t->id) t->id = '?';
+      t->rank = rank;
+      t->detached = detached;
+      if (detached) ndetach++;
+      t->rttmin = -1;
+      t->lastcolor = 99;
+      tmp2 = strtok(NULL, "\n");
+      if (tmp2) {
+        if (!(t->comment = (char *)malloc(strlen(tmp2)+1))) {
+          perror("malloc()");
+          return -1;
+        }
+        strcpy(t->comment, tmp2);
+        if (2*rank+strlen(tmp2)+1 > maxwidth) maxwidth = 2*rank+strlen(tmp2)+1;
       }
-      strcpy(t->comment, tmp2);
-      if (2*rank+strlen(tmp2)+1 > maxwidth) maxwidth = 2*rank+strlen(tmp2)+1;
-    }
-    else if (2*rank > maxwidth) maxwidth = 2*rank;
+      else if (2*rank > maxwidth) maxwidth = 2*rank;
 
+      if (!targets) targets = t;
+      else {
+        for (tmp = targets; tmp->next; tmp = tmp->next);
+        tmp->next = t;
+      }
+      ntargets++;
+      detached = 0;
+
+      if (t->comment) {
+        printf("%c %s [%s] (%s)\n", t->id, t->name, t->ipstr, t->comment);
+      }
+      else {
+        printf("%c %s [%s]\n", t->id, t->name, t->ipstr);
+      }
+    }
+
+    count++;
     freeaddrinfo(res);
-
-    if (!targets) targets = t;
-    else {
-      for (tmp = targets; tmp->next; tmp = tmp->next);
-      tmp->next = t;
-    }
-    ntargets++;
-    detached = 0;
-
-    if (t->comment) {
-      printf("%c %s (%s):\n", t->id, t->name, t->comment);
-    }
-    else {
-      printf("%c %s:\n", t->id, t->name);
-    }
-    for (int i = 0; t->addrs[i]; i++) {
-      printf("- %s (%s)\n", t->addrs[i]->print, t->addrs[i]->name);
-    }
   }
 
   if (!ntargets) return -1;
@@ -664,7 +652,7 @@ void send_ping(target *t) {
   u_char packet[len];
   struct timeval *tp;
 
-  if (t->addrs[0]->family == AF_INET) {
+  if (t->addr->ss_family == AF_INET) {
     fd = sock4;
     len = sizeof(struct icmp) + sizeof(struct timeval);
     struct icmp *icp = (struct icmp *)packet;
@@ -690,7 +678,7 @@ void send_ping(target *t) {
     gettimeofday(tp, NULL);
   }
 
-  if ((sendto(fd, packet, len, 0, (struct sockaddr *)t->addrs[0]->addr, sizeof(struct sockaddr_storage))) <= 0) perror("sendto()");
+  if ((sendto(fd, packet, len, 0, (struct sockaddr *)t->addr, sizeof(struct sockaddr_storage))) <= 0) perror("sendto()");
 }
 
 u_short calc_checksum(struct icmp *addr, int len) {
@@ -718,7 +706,7 @@ u_short calc_checksum(struct icmp *addr, int len) {
 }
 
 void start_curses(void) {
-  int c, x, y;
+  int c, x, y, currid = 0;
 
   setlocale(LC_ALL, "");
   setenv("NCURSES_NO_UTF8_ACS", "1", 0);
@@ -779,11 +767,14 @@ void start_curses(void) {
   }
   wattron(header, COLOR_PAIR(1));
   wattron(footer, COLOR_PAIR(1));
-  for (c = 0; c < ntargets; c++) {
-    waddch(header, ' ');
-    waddch(footer, ' ');
-    waddch(header, IDSEQUENCE[c]);
-    waddch(footer, IDSEQUENCE[c]);
+  for (target *t = targets; t; t = t->next) {
+    if (t->id != currid) {
+      waddch(header, ' ');
+      waddch(footer, ' ');
+    }
+    currid = t->id;
+    waddch(header, currid);
+    waddch(footer, currid);
   }
   waddch(header, ' ');
   waddch(footer, ' ');
@@ -962,7 +953,7 @@ void print_info(void) {
 
   stddev = sqrtf(tp->sqsum/pinground-pow(tp->rttavg,2));
 
-  if (strlen(tp->name)+strlen(tp->addrs[0]->print)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->name, tp->addrs[0]->print);
+  if (strlen(tp->name)+strlen(tp->ipstr)+5 < 48) snprintf(buf, 48, "%c %s (%s)", tp->id, tp->name, tp->ipstr);
   else snprintf(buf, 48, "%c %s", tp->id, tp->name);
   mvwaddstr(hostinfo, 1, 2, buf);
   snprintf(buf, 48, "Overall statistics     | Last %d minutes", HISTLOG*INTERVAL/60);
